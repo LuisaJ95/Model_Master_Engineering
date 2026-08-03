@@ -160,15 +160,21 @@ Tests main effects and interaction between **transportation cost** and **waste p
 
 ---
 
-### `Exp_2.py` — Response Surface Methodology
+### `Exp_1.2.py` — Waste Penalty Sensitivity Analysis
 
-Central Composite Design (CCD, α = √2) over **food bank capacity** and **fleet capacity**. Fits a second-order polynomial to the objective function surface to identify optimal operating regions.
+Complementary experiment to the 2² factorial design. Analyzes the functional relationship between waste penalty and response variables (net benefit and food waste) while keeping transport cost fixed at its optimal level. Identifies critical thresholds where the system's behavior changes (1 factor × 15 levels = 15 runs). Analyzed via threshold identification, correlation analysis, and trade-off assessment.
+
+---
+
+### `Exp_2.py` — 3² Full Factorial Design
+
+Tests main effects and interaction between fleet capacity and indirect route percentage (2 factors × 3 levels × 3 replicates = 27 runs). Analyzed via main effects, interactions, and response surface visualization.
 
 ---
 
 ### `Exp_3.py` — 3×3 Factorial Design
 
-Tests **tax incentive (β)** × **fleet capacity** at 3 levels each (9 combinations × 4 replicates = 36 runs). Analyzed via two-way ANOVA, Tukey HSD post-hoc tests, and interaction plots.
+Tests main effects and interaction between tax incentive (β) and fleet capacity (2 factors × 3 levels each = 9 runs). Analyzed via interaction plots and eta-squared effect sizes.
 
 ---
 
@@ -202,7 +208,7 @@ model_final.py          ← single-instance optimization
        └── sensitivity_analysis.py ← univariate elasticity analysis
                 │
                 ▼
-       Exp_1 / Exp_2 / Exp_3      ← designed experiments (factorial, RSM)
+ Exp_1 / Exp_1.2 / Exp_2 / Exp_3      ← designed experiments (factorial, RSM)
                 │
                 ▼
        Statistical analysis & visualizations
