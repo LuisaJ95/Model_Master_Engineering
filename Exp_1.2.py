@@ -1,5 +1,5 @@
 """
-EXPERIMENT 2: Sensitivity Analysis - Waste Penalty
+EXPERIMENT 1.2: Sensitivity Analysis - Waste Penalty
 Complementary Experiment to the 2² Factorial
 
 Objective: Analyze the functional relationship between waste penalty and 
