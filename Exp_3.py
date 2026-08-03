@@ -1,64 +1,52 @@
-# %%
 """
-===================================================================================
-EXPERIMENT 3: Interaction Between Tax Incentives and Fleet Capacity
-COMPLETE STANDALONE VERSION
-===================================================================================
-Design: 3x3 Factorial Design (9 treatment combinations, 4 replicates = 36 runs)
+3² FACTORIAL EXPERIMENT - INTERACTION BETWEEN TAX INCENTIVES AND TRANSPORT CAPACITY
 
-This file contains:
-1. FoodDonationOptimizer class (simplified for experiments)
-2. Experimental design setup
-3. Experiment execution engine
-4. Statistical analysis (ANOVA, contrasts, regression)
-5. Visualization tools
-6. Main execution
+This experiment analyzes the joint effect of:
+- Factor 1: Tax benefit (β) - 3 levels
+- Factor 2: Own transport capacity - 3 levels
 
-Usage:
-    python experiment_3_complete.py
+Total: 9 experimental scenarios (3×3)
 
-Requirements:
-    - instance_distance_exp.json (base data file)
-    - gurobipy, numpy, pandas, matplotlib, seaborn, scipy, statsmodels
-===================================================================================
+Response variables:
+1. Total net benefit
+2. Compliance rate
+3. Outsourcing percentage
+
+Analysis:
+- Interaction plots
+- Eta squared (η²) to quantify effect size
+- Elasticity matrix
 """
 
 import gurobipy as gp
 from gurobipy import GRB
 import json
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
-from scipy import stats
-from statsmodels.formula.api import ols
-from statsmodels.stats.anova import anova_lm
-from statsmodels.stats.multicomp import pairwise_tukeyhsd
-import time
 from copy import deepcopy
-import warnings
-warnings.filterwarnings('ignore')
-
-# Set plotting style
-plt.style.use('seaborn-v0_8-darkgrid')
-sns.set_palette("husl")
-
-print("="*80)
-print("EXPERIMENT 3: TAX INCENTIVES × FLEET CAPACITY INTERACTION")
-print("="*80)
-print("\n✓ Libraries imported successfully\n")
+import time
+import os
 
 
-# ===================================================================================
-# OPTIMIZER CLASS (Simplified for Experiments)
-# ===================================================================================
+# ==============================================================================
+# OPTIMIZER CLASS (COPIED FROM ORIGINAL MODEL)
+# ==============================================================================
 
 class FoodDonationOptimizer:
-    """Simplified optimizer for experimental runs."""
+    """
+    Optimizer for food donation network with direct and indirect routes.
+    
+    Direct routes: Origin -> Food Bank (same day)
+    Indirect routes: Client -> Distribution Center -> Food Bank (two days)
+    """
     
     def __init__(self, env):
+        """Initialize optimizer with Gurobi environment."""
         self.env = env
         self.model = None
+        
+        # Data attributes
         self.requirements = []
         self.requirements_dict = {}
         self.R_direct = []
@@ -66,6 +54,8 @@ class FoodDonationOptimizer:
         self.T = []
         self.B = []
         self.P = []
+        
+        # Parameters
         self.beta = 0
         self.pi = 0
         self.c_trans = 0
@@ -73,15 +63,19 @@ class FoodDonationOptimizer:
         self.product_costs = {}
         self.food_bank_capacity = {}
         self.transport_capacity = {}
+        
+        # Decision variables
         self.y_deliv = {}
         self.x_out = {}
         self.y_pickup = {}
         self.w = {}
     
     def __enter__(self):
+        """Enter context manager."""
         return self
     
     def __exit__(self, exc_type, exc_val, exc_tb):
+        """Exit context manager and dispose model."""
         if self.model is not None:
             self.model.dispose()
         return False
@@ -91,18 +85,23 @@ class FoodDonationOptimizer:
         with open(json_file, 'r', encoding='utf-8') as f:
             data = json.load(f)
         
+        # Load requirements and classify them
         self.requirements = data['requirements']
         
+        # Create dictionary for O(1) lookup
         for req in self.requirements:
             self.requirements_dict[req['id']] = req
+        
+        for req in self.requirements:
             req_id = req['id']
             origin_type = req['origin_type']
             
             if origin_type in ['Manufacturing', 'DistributionCenter']:
                 self.R_direct.append(req_id)
-            else:
+            else:  # Client
                 self.R_indirect.append(req_id)
         
+        # Load sets
         self.T = list(range(
             data['planning_horizon']['start_period'],
             data['planning_horizon']['end_period'] + 1
@@ -110,6 +109,7 @@ class FoodDonationOptimizer:
         self.B = data['sets']['food_banks']
         self.P = data['sets']['products']
         
+        # Load parameters
         params = data['parameters']
         self.beta = params['beta_1']
         self.pi = params['pi_penalty']
@@ -118,95 +118,218 @@ class FoodDonationOptimizer:
         self.product_costs = params['product_costs']
         self.food_bank_capacity = params['food_bank_capacity']
         
+        # Transport capacity
         trans_cap = params['transport_capacity_per_period']
         self.transport_capacity = {t: trans_cap for t in self.T}
     
     def _get_requirement_by_id(self, req_id):
+        """Helper function to get requirement data by ID (O(1) lookup)."""
         return self.requirements_dict.get(req_id)
     
     def build_model(self):
         """Build the optimization model."""
-        self.model = gp.Model("FoodDonation", env=self.env)
+        # Create model
+        self.model = gp.Model("FoodDonationOptimization", env=self.env)
+        
+        # Create variables
         self._create_variables()
+        
+        # Set objective
         self._set_objective()
+        
+        # Add constraints
         self._add_constraints()
+        
+        # Update model
         self.model.update()
     
     def _create_variables(self):
-        """Create decision variables."""
+        """Create all decision variables."""
+        # Variables for DIRECT requirements
         for r in self.R_direct:
             req = self._get_requirement_by_id(r)
-            l_r, e_r = req['release_date'], req['expiration_date']
+            l_r = req['release_date']
+            e_r = req['expiration_date']
+            
             for t in range(l_r, e_r + 1):
-                self.y_deliv[r, t] = self.model.addVar(lb=0, vtype=GRB.CONTINUOUS, name=f"y_deliv_D_{r}_{t}")
-                self.x_out[r, t] = self.model.addVar(lb=0, vtype=GRB.CONTINUOUS, name=f"x_out_{r}_{t}")
+                self.y_deliv[r, t] = self.model.addVar(
+                    lb=0, vtype=GRB.CONTINUOUS,
+                    name=f"y_deliv_D_{r}_{t}"
+                )
+                
+                self.x_out[r, t] = self.model.addVar(
+                    lb=0, vtype=GRB.CONTINUOUS,
+                    name=f"x_out_{r}_{t}"
+                )
         
+        # Variables for INDIRECT requirements
         for r in self.R_indirect:
             req = self._get_requirement_by_id(r)
-            l_r, e_r = req['release_date'], req['expiration_date']
+            l_r = req['release_date']
+            e_r = req['expiration_date']
+            
             for t in range(l_r, e_r):
-                self.y_pickup[r, t] = self.model.addVar(lb=0, vtype=GRB.CONTINUOUS, name=f"y_pickup_{r}_{t}")
+                self.y_pickup[r, t] = self.model.addVar(
+                    lb=0, vtype=GRB.CONTINUOUS,
+                    name=f"y_pickup_{r}_{t}"
+                )
+            
             for t in range(l_r + 1, e_r + 1):
-                self.y_deliv[r, t] = self.model.addVar(lb=0, vtype=GRB.CONTINUOUS, name=f"y_deliv_I_{r}_{t}")
+                self.y_deliv[r, t] = self.model.addVar(
+                    lb=0, vtype=GRB.CONTINUOUS,
+                    name=f"y_deliv_I_{r}_{t}"
+                )
         
+        # Waste variables
         for r in self.R_direct + self.R_indirect:
-            self.w[r] = self.model.addVar(lb=0, vtype=GRB.CONTINUOUS, name=f"w_{r}")
+            self.w[r] = self.model.addVar(
+                lb=0, vtype=GRB.CONTINUOUS,
+                name=f"w_{r}"
+            )
     
     def _set_objective(self):
-        """Set objective function."""
+        """Set the objective function to maximize net benefit."""
         product_benefit_terms = []
+        
+        # Direct requirements
+        for r in self.R_direct:
+            req = self._get_requirement_by_id(r)
+            product = req['product']
+            c_prod = self.product_costs.get(product, 0)
+            l_r = req['release_date']
+            e_r = req['expiration_date']
+            
+            benefit_coef = self.beta * c_prod
+            
+            for t in range(l_r, e_r + 1):
+                product_benefit_terms.append(benefit_coef * self.y_deliv[r, t])
+                product_benefit_terms.append(benefit_coef * self.x_out[r, t])
+        
+        # Indirect requirements
+        for r in self.R_indirect:
+            req = self._get_requirement_by_id(r)
+            product = req['product']
+            c_prod = self.product_costs.get(product, 0)
+            l_r = req['release_date']
+            e_r = req['expiration_date']
+            
+            benefit_coef = self.beta * c_prod
+            
+            for t in range(l_r + 1, e_r + 1):
+                product_benefit_terms.append(benefit_coef * self.y_deliv[r, t])
+        
+        # Transportation benefit terms
         transport_benefit_terms = []
+        
+        # Direct requirements
+        for r in self.R_direct:
+            req = self._get_requirement_by_id(r)
+            dist = req['distance']
+            l_r = req['release_date']
+            e_r = req['expiration_date']
+            
+            benefit_coef = self.beta * self.c_trans * dist
+            
+            for t in range(l_r, e_r + 1):
+                transport_benefit_terms.append(benefit_coef * self.y_deliv[r, t])
+                transport_benefit_terms.append(benefit_coef * self.alpha * self.x_out[r, t])
+        
+        # Indirect requirements
+        for r in self.R_indirect:
+            req = self._get_requirement_by_id(r)
+            dist_indir = req['dist_indirect']
+            l_r = req['release_date']
+            e_r = req['expiration_date']
+            
+            benefit_coef = self.beta * self.c_trans * dist_indir
+            
+            for t in range(l_r + 1, e_r + 1):
+                transport_benefit_terms.append(benefit_coef * self.y_deliv[r, t])
+        
+        # Transportation cost terms
         transport_cost_terms = []
+        
+        # Direct requirements
+        for r in self.R_direct:
+            req = self._get_requirement_by_id(r)
+            dist = req['distance']
+            l_r = req['release_date']
+            e_r = req['expiration_date']
+            
+            cost_coef = self.c_trans * dist
+            
+            for t in range(l_r, e_r + 1):
+                transport_cost_terms.append(cost_coef * self.y_deliv[r, t])
+        
+        # Indirect requirements
+        for r in self.R_indirect:
+            req = self._get_requirement_by_id(r)
+            dist_indir = req['dist_indirect']
+            l_r = req['release_date']
+            e_r = req['expiration_date']
+            
+            cost_coef = self.c_trans * dist_indir
+            
+            for t in range(l_r + 1, e_r + 1):
+                transport_cost_terms.append(cost_coef * self.y_deliv[r, t])
+        
+        # Outsourcing cost terms
         outsource_cost_terms = []
         
         for r in self.R_direct:
             req = self._get_requirement_by_id(r)
-            product, dist = req['product'], req['distance']
-            c_prod = self.product_costs.get(product, 0)
-            l_r, e_r = req['release_date'], req['expiration_date']
+            dist = req['distance']
+            l_r = req['release_date']
+            e_r = req['expiration_date']
+            
+            cost_coef = self.alpha * self.c_trans * dist
             
             for t in range(l_r, e_r + 1):
-                product_benefit_terms.append(self.beta * c_prod * (self.y_deliv[r, t] + self.x_out[r, t]))
-                transport_benefit_terms.append(self.beta * self.c_trans * dist * (self.y_deliv[r, t] + self.alpha * self.x_out[r, t]))
-                transport_cost_terms.append(self.c_trans * dist * self.y_deliv[r, t])
-                outsource_cost_terms.append(self.alpha * self.c_trans * dist * self.x_out[r, t])
+                outsource_cost_terms.append(cost_coef * self.x_out[r, t])
         
-        for r in self.R_indirect:
-            req = self._get_requirement_by_id(r)
-            product, dist_indir = req['product'], req['dist_indirect']
-            c_prod = self.product_costs.get(product, 0)
-            l_r, e_r = req['release_date'], req['expiration_date']
-            
-            for t in range(l_r + 1, e_r + 1):
-                product_benefit_terms.append(self.beta * c_prod * self.y_deliv[r, t])
-                transport_benefit_terms.append(self.beta * self.c_trans * dist_indir * self.y_deliv[r, t])
-                transport_cost_terms.append(self.c_trans * dist_indir * self.y_deliv[r, t])
-        
+        # Waste penalties
         waste_terms = [self.pi * self.w[r] for r in self.R_direct + self.R_indirect]
         
-        obj = (gp.quicksum(product_benefit_terms) + gp.quicksum(transport_benefit_terms) -
-               gp.quicksum(transport_cost_terms) - gp.quicksum(outsource_cost_terms) -
-               gp.quicksum(waste_terms))
+        # Combine all components
+        obj = (
+            gp.quicksum(product_benefit_terms) +
+            gp.quicksum(transport_benefit_terms) -
+            gp.quicksum(transport_cost_terms) -
+            gp.quicksum(outsource_cost_terms) -
+            gp.quicksum(waste_terms)
+        )
         
         self.model.setObjective(obj, GRB.MAXIMIZE)
     
     def _add_constraints(self):
-        """Add constraints."""
-        # Flow conservation - Direct
+        """Add all constraints to the model."""
+        # Flow conservation for DIRECT requirements
         for r in self.R_direct:
             req = self._get_requirement_by_id(r)
-            q_r, l_r, e_r = req['quantity'], req['release_date'], req['expiration_date']
+            q_r = req['quantity']
+            l_r = req['release_date']
+            e_r = req['expiration_date']
+            
             self.model.addConstr(
-                gp.quicksum(self.y_deliv[r, t] + self.x_out[r, t] for t in range(l_r, e_r + 1)) + self.w[r] == q_r,
+                gp.quicksum(
+                    self.y_deliv[r, t] + self.x_out[r, t]
+                    for t in range(l_r, e_r + 1)
+                ) + self.w[r] == q_r,
                 name=f"flow_direct_{r}"
             )
         
-        # Flow conservation - Indirect
+        # Flow conservation for INDIRECT requirements
         for r in self.R_indirect:
             req = self._get_requirement_by_id(r)
-            q_r, l_r, e_r = req['quantity'], req['release_date'], req['expiration_date']
+            q_r = req['quantity']
+            l_r = req['release_date']
+            e_r = req['expiration_date']
+            
             self.model.addConstr(
-                gp.quicksum(self.y_deliv[r, t] for t in range(l_r + 1, e_r + 1)) + self.w[r] == q_r,
+                gp.quicksum(
+                    self.y_deliv[r, t]
+                    for t in range(l_r + 1, e_r + 1)
+                ) + self.w[r] == q_r,
                 name=f"flow_indirect_{r}"
             )
         
@@ -215,459 +338,730 @@ class FoodDonationOptimizer:
         indirect_reqs_by_bank = {j: [] for j in self.B}
         
         for r in self.R_direct:
-            dest = self._get_requirement_by_id(r)['destination']
+            req = self._get_requirement_by_id(r)
+            dest = req['destination']
             if dest in direct_reqs_by_bank:
                 direct_reqs_by_bank[dest].append(r)
         
         for r in self.R_indirect:
-            dest = self._get_requirement_by_id(r)['destination']
+            req = self._get_requirement_by_id(r)
+            dest = req['destination']
             if dest in indirect_reqs_by_bank:
                 indirect_reqs_by_bank[dest].append(r)
         
         for j in self.B:
             cap_j = self.food_bank_capacity.get(j, 0)
+            
             for t in self.T:
                 deliveries = []
+                
                 for r in direct_reqs_by_bank[j]:
                     req = self._get_requirement_by_id(r)
-                    l_r, e_r = req['release_date'], req['expiration_date']
+                    l_r = req['release_date']
+                    e_r = req['expiration_date']
                     if l_r <= t <= e_r:
                         deliveries.append(self.y_deliv[r, t] + self.x_out[r, t])
                 
                 for r in indirect_reqs_by_bank[j]:
                     req = self._get_requirement_by_id(r)
-                    l_r, e_r = req['release_date'], req['expiration_date']
+                    l_r = req['release_date']
+                    e_r = req['expiration_date']
                     if l_r + 1 <= t <= e_r:
                         deliveries.append(self.y_deliv[r, t])
                 
                 if deliveries:
-                    self.model.addConstr(gp.quicksum(deliveries) <= cap_j, name=f"foodbank_cap_{j}_{t}")
+                    self.model.addConstr(
+                        gp.quicksum(deliveries) <= cap_j,
+                        name=f"foodbank_cap_{j}_{t}"
+                    )
         
-        # Transport capacity
+        # Transportation capacity
         for t in self.T:
             cap_trans = self.transport_capacity[t]
+            
             fleet_usage = []
             
             for r in self.R_direct:
                 req = self._get_requirement_by_id(r)
-                l_r, e_r = req['release_date'], req['expiration_date']
+                l_r = req['release_date']
+                e_r = req['expiration_date']
                 if l_r <= t <= e_r:
                     fleet_usage.append(self.y_deliv[r, t])
             
             for r in self.R_indirect:
                 req = self._get_requirement_by_id(r)
-                l_r, e_r = req['release_date'], req['expiration_date']
+                l_r = req['release_date']
+                e_r = req['expiration_date']
                 if l_r <= t < e_r:
                     fleet_usage.append(self.y_pickup[r, t])
+            
+            for r in self.R_indirect:
+                req = self._get_requirement_by_id(r)
+                l_r = req['release_date']
+                e_r = req['expiration_date']
                 if l_r + 1 <= t <= e_r:
                     fleet_usage.append(self.y_deliv[r, t])
             
             if fleet_usage:
-                self.model.addConstr(gp.quicksum(fleet_usage) <= cap_trans, name=f"transport_cap_{t}")
+                self.model.addConstr(
+                    gp.quicksum(fleet_usage) <= cap_trans,
+                    name=f"transport_cap_{t}"
+                )
         
-        # Synchronization - Indirect
+        # Synchronization for INDIRECT requirements
         for r in self.R_indirect:
             req = self._get_requirement_by_id(r)
-            l_r, e_r = req['release_date'], req['expiration_date']
+            l_r = req['release_date']
+            e_r = req['expiration_date']
+            
             for t in range(l_r, e_r):
-                self.model.addConstr(self.y_pickup[r, t] == self.y_deliv[r, t + 1], name=f"sync_{r}_{t}")
+                self.model.addConstr(
+                    self.y_pickup[r, t] == self.y_deliv[r, t + 1],
+                    name=f"sync_{r}_{t}"
+                )
     
     def optimize(self):
-        """Solve the model."""
+        """Solve the optimization model."""
         self.model.optimize()
         return self.model.Status
     
-    def _calculate_metrics(self):
-        """Calculate detailed metrics."""
-        if self.model.Status not in [GRB.OPTIMAL, GRB.TIME_LIMIT] or self.model.SolCount == 0:
+    def get_metrics(self):
+        """Calculate and return key metrics."""
+        if self.model.Status not in [GRB.OPTIMAL, GRB.TIME_LIMIT]:
+            return None
+        
+        if self.model.SolCount == 0:
             return None
         
         metrics = {
-            'tax_benefit_products': 0,
-            'tax_benefit_transport': 0,
-            'own_fleet_costs': 0,
-            'outsourcing_costs': 0,
-            'waste_penalty': 0,
-            'total_donated': 0,
-            'total_wasted': 0,
-            'total_outsourced': 0,
-            'total_available': 0,
-            'donation_rate': 0
+            'objetivo': self.model.ObjVal,
+            'total_disponible': 0,
+            'total_donado': 0,
+            'total_desperdiciado': 0,
+            'total_subcontratado': 0,
+            'tasa_cumplimiento': 0,
+            'pct_subcontratacion': 0
         }
         
-        # Calculate metrics from solution
+        # Calculate totals
+        for r in self.R_direct + self.R_indirect:
+            req = self._get_requirement_by_id(r)
+            metrics['total_disponible'] += req['quantity']
+            metrics['total_desperdiciado'] += self.w[r].X
+        
+        # Direct deliveries
         for r in self.R_direct:
             req = self._get_requirement_by_id(r)
-            product, dist = req['product'], req['distance']
-            c_prod = self.product_costs.get(product, 0)
-            l_r, e_r = req['release_date'], req['expiration_date']
+            l_r = req['release_date']
+            e_r = req['expiration_date']
             
             for t in range(l_r, e_r + 1):
-                y_val = self.y_deliv[r, t].X
-                x_val = self.x_out[r, t].X
-                metrics['tax_benefit_products'] += self.beta * c_prod * (y_val + x_val)
-                metrics['tax_benefit_transport'] += self.beta * self.c_trans * dist * (y_val + self.alpha * x_val)
-                metrics['own_fleet_costs'] += self.c_trans * dist * y_val
-                metrics['outsourcing_costs'] += self.alpha * self.c_trans * dist * x_val
-                metrics['total_donated'] += y_val + x_val
-                metrics['total_outsourced'] += x_val
+                metrics['total_donado'] += self.y_deliv[r, t].X
+                metrics['total_donado'] += self.x_out[r, t].X
+                metrics['total_subcontratado'] += self.x_out[r, t].X
         
+        # Indirect deliveries
         for r in self.R_indirect:
             req = self._get_requirement_by_id(r)
-            product, dist_indir = req['product'], req['dist_indirect']
-            c_prod = self.product_costs.get(product, 0)
-            l_r, e_r = req['release_date'], req['expiration_date']
+            l_r = req['release_date']
+            e_r = req['expiration_date']
             
             for t in range(l_r + 1, e_r + 1):
-                y_val = self.y_deliv[r, t].X
-                metrics['tax_benefit_products'] += self.beta * c_prod * y_val
-                metrics['tax_benefit_transport'] += self.beta * self.c_trans * dist_indir * y_val
-                metrics['own_fleet_costs'] += self.c_trans * dist_indir * y_val
-                metrics['total_donated'] += y_val
+                metrics['total_donado'] += self.y_deliv[r, t].X
         
-        for r in self.R_direct + self.R_indirect:
-            w_val = self.w[r].X
-            metrics['waste_penalty'] += self.pi * w_val
-            metrics['total_wasted'] += w_val
-            metrics['total_available'] += self._get_requirement_by_id(r)['quantity']
+        # Calculate rates
+        if metrics['total_disponible'] > 0:
+            metrics['tasa_cumplimiento'] = (metrics['total_donado'] / metrics['total_disponible']) * 100
         
-        if metrics['total_available'] > 0:
-            metrics['donation_rate'] = (metrics['total_donated'] / metrics['total_available']) * 100
+        if metrics['total_donado'] > 0:
+            metrics['pct_subcontratacion'] = (metrics['total_subcontratado'] / metrics['total_donado']) * 100
         
         return metrics
+
+
+# ==============================================================================
+# 3² FACTORIAL EXPERIMENTAL DESIGN
+# ==============================================================================
+
+class FactorialExperiment:
+    """
+    3² factorial experiment to analyze the interaction between:
+    - Tax benefit (β)
+    - Own transport capacity
+    """
     
-    def get_solution(self):
-        """Extract solution details."""
-        if self.model.Status not in [GRB.OPTIMAL, GRB.TIME_LIMIT] or self.model.SolCount == 0:
-            return None
+    def __init__(self, instance_file='instance_distance_exp.json'):
+        """
+        Initialize experiment.
         
-        solution = {
-            'objective_value': self.model.ObjVal,
-            'total_donated': 0,
-            'total_wasted': 0,
-            'total_outsourced': 0
+        Args:
+            instance_file: JSON file with the instance data
+        """
+        self.instance_file = instance_file
+        self.results = []
+        
+        # Load base data
+        with open(instance_file, 'r', encoding='utf-8') as f:
+            self.base_data = json.load(f)
+        
+        # Save original base values
+        self.base_beta = self.base_data['parameters']['beta_1']
+        self.base_capacity = self.base_data['parameters']['transport_capacity_per_period']
+        
+        print("="*80)
+        print("3² FACTORIAL EXPERIMENT - INTERACTION β × TRANSPORT CAPACITY")
+        print("="*80)
+        print(f"\nBase values:")
+        print(f"  β (tax benefit): {self.base_beta}")
+        print(f"  Transport capacity: {self.base_capacity} kg/period")
+    
+    def define_factorial_levels(self):
+        """
+        Define the 3 levels for each factor.
+        
+        Factor 1 (β): Low (10%), Medium (100%), High (400%)
+        Factor 2 (Capacity): Limited (10%), Standard (100%), Expanded (400%)
+        """
+        # Factor 1 levels: Tax benefit (β)
+        self.beta_levels = {
+            'Low': 0.10 * self.base_beta,
+            'Medium': 1.00 * self.base_beta,
+            'High': 4.00 * self.base_beta
         }
         
-        for r in self.R_direct:
-            req = self._get_requirement_by_id(r)
-            l_r, e_r = req['release_date'], req['expiration_date']
-            for t in range(l_r, e_r + 1):
-                solution['total_donated'] += self.y_deliv[r, t].X + self.x_out[r, t].X
-                solution['total_outsourced'] += self.x_out[r, t].X
+        # Factor 2 levels: Transport capacity
+        self.capacity_levels = {
+            'Limited': 0.10 * self.base_capacity,
+            'Standard': 1.00 * self.base_capacity,
+            'Expanded': 4.00 * self.base_capacity
+        }
         
-        for r in self.R_indirect:
-            req = self._get_requirement_by_id(r)
-            l_r, e_r = req['release_date'], req['expiration_date']
-            for t in range(l_r + 1, e_r + 1):
-                solution['total_donated'] += self.y_deliv[r, t].X
+        print("\n" + "-"*80)
+        print("FACTORIAL LEVELS DEFINED")
+        print("-"*80)
         
-        for r in self.R_direct + self.R_indirect:
-            solution['total_wasted'] += self.w[r].X
+        print("\nFactor 1 - Tax Benefit (β):")
+        for level, value in self.beta_levels.items():
+            pct = (value / self.base_beta) * 100
+            print(f"  {level:10s}: {value:.4f} ({pct:.0f}% of base)")
         
-        return solution
-
-
-# ===================================================================================
-# EXPERIMENTAL DESIGN
-# ===================================================================================
-
-class ExperimentalDesign:
-    """Factorial experimental design 3×3."""
+        print("\nFactor 2 - Transport Capacity:")
+        for level, value in self.capacity_levels.items():
+            pct = (value / self.base_capacity) * 100
+            print(f"  {level:10s}: {value:.2f} kg ({pct:.0f}% of base)")
     
-    def __init__(self):
-        self.factor_A_levels = {'Low': 0.10, 'Medium': 0.37, 'High': 0.90}
-        self.factor_B_levels = {'Limited': 200, 'Standard': 8000, 'Expanded': 14000}
-        self.num_replicates = 4
-        self.treatments = self._generate_treatments()
-        self.run_order = self._randomize_runs()
-    
-    def _generate_treatments(self):
-        treatments = []
-        treatment_id = 1
-        for a_label, a_value in self.factor_A_levels.items():
-            for b_label, b_value in self.factor_B_levels.items():
-                treatments.append({
-                    'treatment_id': treatment_id,
-                    'factor_A_label': a_label,
-                    'factor_A_value': a_value,
-                    'factor_B_label': b_label,
-                    'factor_B_value': b_value,
-                    'combination': f"{a_label}_{b_label}"
-                })
-                treatment_id += 1
-        return treatments
-    
-    def _randomize_runs(self):
-        runs = []
-        run_id = 1
-        for replicate in range(1, self.num_replicates + 1):
-            for treatment in self.treatments:
-                runs.append({
-                    'run_id': run_id,
-                    'replicate': replicate,
-                    **treatment
-                })
-                run_id += 1
+    def generate_scenarios(self):
+        """
+        Generate the 9 factorial combinations (3×3).
+        """
+        self.scenarios = []
         
-        np.random.seed(42)
-        np.random.shuffle(runs)
-        for idx, run in enumerate(runs, 1):
-            run['run_id'] = idx
-        return runs
+        for beta_name, beta_value in self.beta_levels.items():
+            for cap_name, cap_value in self.capacity_levels.items():
+                scenario = {
+                    'id': len(self.scenarios) + 1,
+                    'beta_level': beta_name,
+                    'beta_value': beta_value,
+                    'capacity_level': cap_name,
+                    'capacity_value': cap_value
+                }
+                self.scenarios.append(scenario)
+        
+        print(f"\n✓ {len(self.scenarios)} experimental scenarios generated")
+        
+        return self.scenarios
     
-    def display_design(self):
+    def run_experiment(self, verbose=True):
+        """
+        Execute the 9 scenarios of the factorial design.
+        
+        Args:
+            verbose: If True, shows detailed progress
+        """
         print("\n" + "="*80)
-        print("EXPERIMENTAL DESIGN")
+        print("RUNNING FACTORIAL EXPERIMENT")
         print("="*80)
-        print(f"\n3×3 Factorial Design: {len(self.treatments)} treatments × {self.num_replicates} replicates = {len(self.run_order)} runs")
-        print(f"\nFactor A (Tax Benefit β₁): {list(self.factor_A_levels.values())}")
-        print(f"Factor B (Fleet Capacity): {list(self.factor_B_levels.values())} kg")
-        return pd.DataFrame(self.run_order)
-
-
-# ===================================================================================
-# EXPERIMENT RUNNER
-# ===================================================================================
-
-class ExperimentRunner:
-    """Execute experiments."""
-    
-    def __init__(self, base_data_file, design):
-        self.base_data_file = base_data_file
-        self.design = design
+        
         self.results = []
-        with open(base_data_file, 'r') as f:
-            self.base_data = json.load(f)
-    
-    def _modify_instance(self, run_config):
-        data = deepcopy(self.base_data)
-        data['parameters']['beta_1'] = run_config['factor_A_value']
-        data['parameters']['transport_capacity_per_period'] = run_config['factor_B_value']
         
-        # Scenario: 50% demand increase
-        for req in data['requirements']:
-            req['quantity'] = req['quantity'] * 1.5
-        
-        return data
-    
-    def _run_optimization(self, data, run_config):
-        try:
-            with gp.Env(empty=True) as env:
-                env.setParam('OutputFlag', 0)
-                env.setParam('TimeLimit', 300)
-                env.setParam('MIPGap', 0.01)
-                env.start()
+        # Create silent Gurobi environment
+        with gp.Env(empty=True) as env:
+            env.setParam('OutputFlag', 0)  # Suppress output
+            env.setParam('TimeLimit', 300)  # 5 minutes per scenario
+            env.start()
+            
+            for i, scenario in enumerate(self.scenarios, 1):
+                if verbose:
+                    print(f"\n[{i}/{len(self.scenarios)}] Scenario {scenario['id']}: " +
+                          f"β={scenario['beta_level']}, Capacity={scenario['capacity_level']}")
                 
-                temp_file = f"temp_run_{run_config['run_id']}.json"
-                with open(temp_file, 'w') as f:
-                    json.dump(data, f)
+                # Modify data for this scenario
+                scenario_data = deepcopy(self.base_data)
+                scenario_data['parameters']['beta_1'] = scenario['beta_value']
+                scenario_data['parameters']['transport_capacity_per_period'] = scenario['capacity_value']
                 
-                with FoodDonationOptimizer(env) as optimizer:
-                    optimizer.load_data_from_json(temp_file)
-                    optimizer.build_model()
-                    status = optimizer.optimize()
+                # Save temporary data
+                temp_file = f'temp_scenario_{scenario["id"]}.json'
+                with open(temp_file, 'w', encoding='utf-8') as f:
+                    json.dump(scenario_data, f, indent=2)
+                
+                # Run optimization
+                try:
+                    with FoodDonationOptimizer(env) as optimizer:
+                        optimizer.load_data_from_json(temp_file)
+                        optimizer.build_model()
+                        status = optimizer.optimize()
+                        
+                        if status == GRB.OPTIMAL:
+                            metrics = optimizer.get_metrics()
+                            
+                            result = {
+                                **scenario,
+                                **metrics,
+                                'status': 'OPTIMAL'
+                            }
+                            
+                            if verbose:
+                                print(f"    ✓ Benefit: ${metrics['objetivo']:,.2f}")
+                                print(f"    ✓ Compliance: {metrics['tasa_cumplimiento']:.2f}%")
+                                print(f"    ✓ Outsourcing: {metrics['pct_subcontratacion']:.2f}%")
+                        else:
+                            result = {
+                                **scenario,
+                                'status': 'INFEASIBLE'
+                            }
+                            if verbose:
+                                print(f"    ✗ Infeasible model")
                     
-                    if status == GRB.OPTIMAL or (status == GRB.TIME_LIMIT and optimizer.model.SolCount > 0):
-                        metrics = optimizer._calculate_metrics()
-                        solution = optimizer.get_solution()
-                        
-                        y1_profit = optimizer.model.ObjVal
-                        y2_compliance = metrics['donation_rate']
-                        
-                        total_transported = metrics['total_donated']
-                        y3_outsourcing = (solution['total_outsourced'] / total_transported * 100) if total_transported > 0 else 0
-                        
-                        return {
-                            'status': 'optimal',
-                            'Y1_profit': y1_profit,
-                            'Y2_compliance': y2_compliance,
-                            'Y3_outsourcing': y3_outsourcing,
-                            'total_donated': metrics['total_donated'],
-                            'total_wasted': metrics['total_wasted'],
-                            'total_outsourced': solution['total_outsourced']
-                        }
-                    else:
-                        return {'status': 'infeasible', 'Y1_profit': np.nan, 'Y2_compliance': np.nan, 'Y3_outsourcing': np.nan}
-        except Exception as e:
-            print(f"  Error in run {run_config['run_id']}: {e}")
-            return {'status': 'error', 'Y1_profit': np.nan, 'Y2_compliance': np.nan, 'Y3_outsourcing': np.nan}
-    
-    def run_all_experiments(self):
-        print("\n" + "="*80)
-        print("RUNNING EXPERIMENTS")
-        print("="*80)
-        
-        total = len(self.design.run_order)
-        for idx, run_config in enumerate(self.design.run_order, 1):
-            print(f"\n[{idx}/{total}] Run {run_config['run_id']}: β₁={run_config['factor_A_value']:.2f}, cap={run_config['factor_B_value']:.0f}kg")
-            
-            modified_data = self._modify_instance(run_config)
-            result = self._run_optimization(modified_data, run_config)
-            
-            self.results.append({**run_config, **result})
-            
-            if result['status'] == 'optimal':
-                print(f"  Profit: ${result['Y1_profit']:,.2f}, Compliance: {result['Y2_compliance']:.1f}%, Outsourcing: {result['Y3_outsourcing']:.1f}%")
+                    self.results.append(result)
+                
+                except Exception as e:
+                    print(f"    ✗ Error: {e}")
+                    result = {
+                        **scenario,
+                        'status': 'ERROR',
+                        'error': str(e)
+                    }
+                    self.results.append(result)
+                
+                finally:
+                    # Clean up temporary file
+                    if os.path.exists(temp_file):
+                        os.remove(temp_file)
         
         print("\n" + "="*80)
-        print("✓ EXPERIMENTS COMPLETED")
+        print("EXPERIMENT COMPLETED")
         print("="*80)
-        
-        return pd.DataFrame(self.results)
-
-
-# ===================================================================================
-# STATISTICAL ANALYSIS
-# ===================================================================================
-
-class StatisticalAnalysis:
-    """Statistical analysis of experimental results."""
+        print(f"✓ {len([r for r in self.results if r.get('status') == 'OPTIMAL'])} scenarios solved optimally")
+        print(f"✗ {len([r for r in self.results if r.get('status') != 'OPTIMAL'])} scenarios with issues")
     
-    def __init__(self, results_df):
-        self.df = results_df.dropna(subset=['Y1_profit', 'Y2_compliance', 'Y3_outsourcing'])
+    def create_results_dataframe(self):
+        """
+        Convert results to DataFrame for analysis.
+        """
+        df = pd.DataFrame(self.results)
+        
+        # Filter only optimal results
+        df_opt = df[df['status'] == 'OPTIMAL'].copy()
+        
+        # Order by levels
+        beta_order = ['Low', 'Medium', 'High']
+        cap_order = ['Limited', 'Standard', 'Expanded']
+        
+        df_opt['beta_level'] = pd.Categorical(df_opt['beta_level'], categories=beta_order, ordered=True)
+        df_opt['capacity_level'] = pd.Categorical(df_opt['capacity_level'], categories=cap_order, ordered=True)
+        
+        df_opt = df_opt.sort_values(['beta_level', 'capacity_level'])
+        
+        self.results_df = df_opt
+        return df_opt
     
-    def perform_two_way_anova(self, response_var='Y1_profit'):
-        print(f"\n{'='*80}")
-        print(f"TWO-WAY ANOVA: {response_var}")
-        print("="*80)
+    def calculate_sum_of_squares(self, response_var='objetivo'):
+        """
+        Calculate sum of squares decomposition for ANOVA.
         
-        formula = f'{response_var} ~ C(factor_A_label) + C(factor_B_label) + C(factor_A_label):C(factor_B_label)'
-        model = ols(formula, data=self.df).fit()
-        anova_table = anova_lm(model, typ=2)
+        Args:
+            response_var: Variable to analyze ('objetivo', 'tasa_cumplimiento', 'pct_subcontratacion')
         
-        print("\nANOVA Table:")
-        print(anova_table)
+        Returns:
+            dict: Sum of squares and eta squared
+        """
+        df = self.results_df
         
-        print("\n📊 Interpretation:")
-        for effect in anova_table.index[:-1]:
-            p_value = anova_table.loc[effect, 'PR(>F)']
-            f_value = anova_table.loc[effect, 'F']
-            
-            if 'factor_A' in effect and 'factor_B' in effect:
-                effect_name = "Interaction (A × B)"
-            elif 'factor_A' in effect:
-                effect_name = "Main effect A (Tax Benefit)"
-            elif 'factor_B' in effect:
-                effect_name = "Main effect B (Fleet Capacity)"
-            else:
-                effect_name = effect
-            
-            sig = "***" if p_value < 0.001 else "**" if p_value < 0.01 else "*" if p_value < 0.05 else "ns"
-            print(f"  {effect_name:40s}: F = {f_value:8.2f}, p = {p_value:.4f} {sig}")
+        # Grand mean
+        grand_mean = df[response_var].mean()
         
-        return anova_table, model
-    
-    def comprehensive_analysis(self):
-        print("\n" + "="*80)
-        print("COMPREHENSIVE STATISTICAL ANALYSIS")
-        print("="*80)
+        # Total sum of squares
+        SS_total = ((df[response_var] - grand_mean) ** 2).sum()
         
-        results = {}
-        for var_name, var_label in [('Y1_profit', 'Profit'), ('Y2_compliance', 'Compliance'), ('Y3_outsourcing', 'Outsourcing')]:
-            print(f"\n{'='*80}")
-            print(f"ANALYSIS: {var_label}")
-            print("="*80)
-            
-            anova_table, model = self.perform_two_way_anova(var_name)
-            results[var_name] = {'anova_table': anova_table, 'model': model}
+        # Main effect of β
+        means_beta = df.groupby('beta_level')[response_var].mean()
+        n_per_beta = df.groupby('beta_level').size()
+        SS_beta = sum(n_per_beta * (means_beta - grand_mean) ** 2)
+        
+        # Main effect of Capacity
+        means_cap = df.groupby('capacity_level')[response_var].mean()
+        n_per_cap = df.groupby('capacity_level').size()
+        SS_cap = sum(n_per_cap * (means_cap - grand_mean) ** 2)
+        
+        # Interaction effect
+        means_interaction = df.groupby(['beta_level', 'capacity_level'])[response_var].mean()
+        
+        SS_interaction = 0
+        for (beta_lvl, cap_lvl), cell_mean in means_interaction.items():
+            expected_effect = means_beta[beta_lvl] + means_cap[cap_lvl] - grand_mean
+            SS_interaction += (cell_mean - expected_effect) ** 2
+        
+        # Residual (in this deterministic case, it should be 0)
+        SS_residual = SS_total - SS_beta - SS_cap - SS_interaction
+        
+        # Eta squared (effect size)
+        eta2_beta = SS_beta / SS_total if SS_total > 0 else 0
+        eta2_cap = SS_cap / SS_total if SS_total > 0 else 0
+        eta2_interaction = SS_interaction / SS_total if SS_total > 0 else 0
+        
+        results = {
+            'SS_total': SS_total,
+            'SS_beta': SS_beta,
+            'SS_capacity': SS_cap,
+            'SS_interaction': SS_interaction,
+            'SS_residual': SS_residual,
+            'eta2_beta': eta2_beta,
+            'eta2_capacity': eta2_cap,
+            'eta2_interaction': eta2_interaction
+        }
         
         return results
-
-
-# ===================================================================================
-# VISUALIZATION
-# ===================================================================================
-
-class ExperimentVisualizer:
-    """Create visualizations."""
     
-    def __init__(self, results_df):
-        self.df = results_df.dropna(subset=['Y1_profit', 'Y2_compliance', 'Y3_outsourcing'])
-    
-    def plot_interaction_profiles(self, save=True):
+    def generate_interaction_plots(self, output_file='interaction_plots.png'):
+        """
+        Generate interaction plots for the three response variables.
+        """
         fig, axes = plt.subplots(1, 3, figsize=(18, 5))
         
-        vars = [('Y1_profit', 'Total Net Profit ($)'), 
-                ('Y2_compliance', 'Compliance Rate (%)'),
-                ('Y3_outsourcing', 'Outsourcing (%)')]
+        variables = [
+            ('objetivo', 'Total Net Benefit ($)', 'objetivo'),
+            ('tasa_cumplimiento', 'Compliance Rate (%)', 'tasa_cumplimiento'),
+            ('pct_subcontratacion', 'Outsourcing Percentage (%)', 'pct_subcontratacion')
+        ]
         
-        for idx, (var_name, var_label) in enumerate(vars):
-            ax = axes[idx]
-            means = self.df.groupby(['factor_A_label', 'factor_B_label'])[var_name].mean().reset_index()
-            pivot = means.pivot(index='factor_A_label', columns='factor_B_label', values=var_name)
-            pivot = pivot.reindex(['Low', 'Medium', 'High'])
+        colors = {'Low': 'blue', 'Medium': 'orange', 'High': 'red'}
+        markers = {'Low': 'o', 'Medium': 's', 'High': '^'}
+        
+        for ax, (var_label, ylabel, var_col) in zip(axes, variables):
+            # Prepare data for the plot
+            for beta_level in ['Low', 'Medium', 'High']:
+                data_beta = self.results_df[self.results_df['beta_level'] == beta_level]
+                
+                x_pos = {'Limited': 0, 'Standard': 1, 'Expanded': 2}
+                x_vals = [x_pos[cap] for cap in data_beta['capacity_level']]
+                y_vals = data_beta[var_col].values
+                
+                ax.plot(x_vals, y_vals, 
+                       marker=markers[beta_level], 
+                       color=colors[beta_level],
+                       linewidth=2,
+                       markersize=10,
+                       label=f'β {beta_level}')
             
-            for col in pivot.columns:
-                ax.plot(['Low', 'Medium', 'High'], pivot[col], 
-                       marker='o', linewidth=2, markersize=8, label=f'{col}')
-            
-            ax.set_xlabel('Tax Benefit (β₁)', fontsize=12, fontweight='bold')
-            ax.set_ylabel(var_label, fontsize=12, fontweight='bold')
-            ax.set_title(f'Interaction: {var_label}', fontsize=13, fontweight='bold')
-            ax.legend(title='Fleet Capacity')
+            ax.set_xlabel('Transport Capacity', fontsize=12, fontweight='bold')
+            ax.set_ylabel(ylabel, fontsize=12, fontweight='bold')
+            ax.set_xticks([0, 1, 2])
+            ax.set_xticklabels(['Limited\n(10%)', 'Standard\n(100%)', 'Expanded\n(400%)'])
+            ax.legend(loc='best', fontsize=10)
             ax.grid(True, alpha=0.3)
+            ax.set_title(f'{var_label}', fontsize=13, fontweight='bold')
         
         plt.tight_layout()
-        if save:
-            plt.savefig('experiment3_interactions.png', dpi=300, bbox_inches='tight')
-            print("\n✓ Saved: experiment3_interactions.png")
-        plt.show()
+        plt.savefig(output_file, dpi=300, bbox_inches='tight')
+        print(f"\n✓ Interaction plots saved to: {output_file}")
+        
+        return fig
     
-    def create_all_visualizations(self):
+    def calculate_elasticity_matrix(self):
+        """
+        Calculate elasticity matrix: percentage increase in benefit
+        when going from Standard to Expanded capacity, under different β levels.
+        """
         print("\n" + "="*80)
-        print("CREATING VISUALIZATIONS")
+        print("ELASTICITY / EFFECT MULTIPLIER MATRIX")
         print("="*80)
-        self.plot_interaction_profiles()
+        print("\nPercentage increase in net benefit when expanding the fleet")
+        print("(from Standard Capacity to Expanded Capacity)")
+        print("-"*80)
+        
+        elasticities = {}
+        
+        for beta_level in ['Low', 'Medium', 'High']:
+            # Benefit with Standard capacity
+            obj_standard = self.results_df[
+                (self.results_df['beta_level'] == beta_level) &
+                (self.results_df['capacity_level'] == 'Standard')
+            ]['objetivo'].values[0]
+            
+            # Benefit with Expanded capacity
+            obj_expanded = self.results_df[
+                (self.results_df['beta_level'] == beta_level) &
+                (self.results_df['capacity_level'] == 'Expanded')
+            ]['objetivo'].values[0]
+            
+            # Percentage increase
+            if obj_standard > 0:
+                increase_pct = ((obj_expanded - obj_standard) / obj_standard) * 100
+            else:
+                increase_pct = 0
+            
+            elasticities[beta_level] = {
+                'obj_standard': obj_standard,
+                'obj_expanded': obj_expanded,
+                'absolute_increase': obj_expanded - obj_standard,
+                'percentage_increase': increase_pct
+            }
+            
+            print(f"\nβ {beta_level}:")
+            print(f"  Benefit (Standard Capacity):  ${obj_standard:>15,.2f}")
+            print(f"  Benefit (Expanded Capacity): ${obj_expanded:>15,.2f}")
+            print(f"  Absolute increase:             ${elasticities[beta_level]['absolute_increase']:>15,.2f}")
+            print(f"  Percentage increase:           {increase_pct:>15.2f}%")
+        
+        # Comparative analysis
+        print("\n" + "="*80)
+        print("COMPARATIVE ELASTICITY ANALYSIS")
+        print("="*80)
+        
+        increases = [elasticities[level]['percentage_increase'] for level in ['Low', 'Medium', 'High']]
+        
+        if increases[2] > increases[0] * 1.5:  # If High is 50% larger than Low
+            print("\n✓ INTERACTION DETECTED:")
+            print("  The return on expanding the fleet is substantially higher when")
+            print("  tax incentives are high. Tax benefits act as a CATALYST for")
+            print("  investment in own capacity.")
+        else:
+            print("\n✓ ADDITIVE EFFECT:")
+            print("  The return on expanding the fleet is relatively constant")
+            print("  regardless of the level of tax incentive.")
+        
+        self.elasticities = elasticities
+        return elasticities
+    
+    def generate_full_report(self, output_file='factorial_experiment_report.txt'):
+        """
+        Generate a full text report with all results.
+        """
+        with open(output_file, 'w', encoding='utf-8') as f:
+            f.write("="*80 + "\n")
+            f.write("3² FACTORIAL EXPERIMENT REPORT - INTERACTION β × CAPACITY\n")
+            f.write("="*80 + "\n\n")
+            
+            f.write("EXPERIMENTAL DESIGN\n")
+            f.write("-"*80 + "\n")
+            f.write(f"Factor 1: Tax Benefit (β) - 3 levels\n")
+            f.write(f"Factor 2: Transport Capacity - 3 levels\n")
+            f.write(f"Total scenarios: {len(self.scenarios)}\n\n")
+            
+            f.write("FACTORIAL LEVELS\n")
+            f.write("-"*80 + "\n")
+            f.write("Tax Benefit (β):\n")
+            for level, value in self.beta_levels.items():
+                f.write(f"  {level}: {value:.4f}\n")
+            
+            f.write("\nTransport Capacity:\n")
+            for level, value in self.capacity_levels.items():
+                f.write(f"  {level}: {value:.2f} kg\n")
+            
+            f.write("\n" + "="*80 + "\n")
+            f.write("RESULTS BY SCENARIO\n")
+            f.write("="*80 + "\n\n")
+            
+            for _, row in self.results_df.iterrows():
+                f.write(f"Scenario {row['id']}: β={row['beta_level']}, Cap={row['capacity_level']}\n")
+                f.write(f"  Net Benefit:           ${row['objetivo']:>15,.2f}\n")
+                f.write(f"  Compliance Rate:       {row['tasa_cumplimiento']:>15.2f}%\n")
+                f.write(f"  Outsourcing %:         {row['pct_subcontratacion']:>15.2f}%\n")
+                f.write(f"  Total Donated:         {row['total_donado']:>15,.2f} kg\n")
+                f.write(f"  Total Wasted:          {row['total_desperdiciado']:>15,.2f} kg\n\n")
+            
+            f.write("="*80 + "\n")
+            f.write("EFFECTS ANALYSIS (ETA SQUARED)\n")
+            f.write("="*80 + "\n\n")
+            
+            for var in ['objetivo', 'tasa_cumplimiento', 'pct_subcontratacion']:
+                ss = self.calculate_sum_of_squares(var)
+                f.write(f"{var.upper().replace('_', ' ')}:\n")
+                f.write(f"  η² (β):              {ss['eta2_beta']:>10.4f} ({ss['eta2_beta']*100:.2f}%)\n")
+                f.write(f"  η² (Capacity):       {ss['eta2_capacity']:>10.4f} ({ss['eta2_capacity']*100:.2f}%)\n")
+                f.write(f"  η² (Interaction):    {ss['eta2_interaction']:>10.4f} ({ss['eta2_interaction']*100:.2f}%)\n\n")
+            
+            f.write("="*80 + "\n")
+            f.write("ELASTICITY MATRIX\n")
+            f.write("="*80 + "\n\n")
+            
+            for beta_level, data in self.elasticities.items():
+                f.write(f"β {beta_level}:\n")
+                f.write(f"  Increase when expanding fleet: {data['percentage_increase']:.2f}%\n\n")
+        
+        print(f"\n✓ Full report saved to: {output_file}")
+    
+    def export_results_excel(self, output_file='factorial_experiment_results.xlsx'):
+        """
+        Export all results to an Excel file with multiple sheets.
+        """
+        with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
+            # Sheet 1: Complete results
+            self.results_df.to_excel(writer, sheet_name='Results', index=False)
+            
+            # Sheet 2: Benefit matrix (pivot table)
+            pivot_benefit = self.results_df.pivot(
+                index='capacity_level',
+                columns='beta_level',
+                values='objetivo'
+            )
+            pivot_benefit.to_excel(writer, sheet_name='Net_Benefit')
+            
+            # Sheet 3: Compliance matrix
+            pivot_compliance = self.results_df.pivot(
+                index='capacity_level',
+                columns='beta_level',
+                values='tasa_cumplimiento'
+            )
+            pivot_compliance.to_excel(writer, sheet_name='Compliance_Rate')
+            
+            # Sheet 4: Outsourcing matrix
+            pivot_outsource = self.results_df.pivot(
+                index='capacity_level',
+                columns='beta_level',
+                values='pct_subcontratacion'
+            )
+            pivot_outsource.to_excel(writer, sheet_name='Outsourcing_Pct')
+            
+            # Sheet 5: Eta squared
+            eta_data = []
+            for var in ['objetivo', 'tasa_cumplimiento', 'pct_subcontratacion']:
+                ss = self.calculate_sum_of_squares(var)
+                eta_data.append({
+                    'Variable': var,
+                    'η² Beta': ss['eta2_beta'],
+                    'η² Capacity': ss['eta2_capacity'],
+                    'η² Interaction': ss['eta2_interaction']
+                })
+            
+            df_eta = pd.DataFrame(eta_data)
+            df_eta.to_excel(writer, sheet_name='Eta_Squared', index=False)
+        
+        print(f"\n✓ Results exported to Excel: {output_file}")
 
 
-# ===================================================================================
-# MAIN EXECUTION
-# ===================================================================================
+# ==============================================================================
+# MAIN FUNCTION
+# ==============================================================================
 
 def main():
+    """
+    Main function to run the complete factorial experiment.
+    """
     print("\n" + "="*80)
-    print("EXPERIMENT 3: MAIN EXECUTION")
-    print("="*80)
+    print(" " * 20 + "3² FACTORIAL EXPERIMENT")
+    print(" " * 10 + "Interaction: Tax Incentives × Transport Capacity")
+    print("="*80 + "\n")
     
-    # Step 1: Design
-    print("\n[1/4] Creating experimental design...")
-    design = ExperimentalDesign()
-    design_df = design.display_design()
-    design_df.to_csv('experiment3_design.csv', index=False)
-    print("✓ Saved: experiment3_design.csv")
+    # Check if data file exists
+    if not os.path.exists('instance_distance_exp.json'):
+        print("❌ ERROR: File 'instance_distance_exp.json' not found")
+        print("   Please ensure the data file is in the current directory.")
+        return
     
-    # Step 2: Run experiments
-    print("\n[2/4] Running experiments...")
-    runner = ExperimentRunner('instance_distance_exp.json', design)
-    results_df = runner.run_all_experiments()
-    results_df.to_csv('experiment3_results.csv', index=False)
-    print("✓ Saved: experiment3_results.csv")
+    # Create experiment
+    experiment = FactorialExperiment('instance_distance_exp.json')
     
-    # Step 3: Statistical analysis
-    print("\n[3/4] Performing statistical analysis...")
-    analyzer = StatisticalAnalysis(results_df)
-    analysis_results = analyzer.comprehensive_analysis()
+    # Define factorial levels
+    experiment.define_factorial_levels()
     
-    # Step 4: Visualizations
-    print("\n[4/4] Creating visualizations...")
-    visualizer = ExperimentVisualizer(results_df)
-    visualizer.create_all_visualizations()
+    # Generate scenarios
+    experiment.generate_scenarios()
     
-    # Summary
+    # Run experiment
+    print("\n⏳ Starting experiment execution...")
+    print("   (This may take several minutes)")
+    
+    start_time = time.time()
+    experiment.run_experiment(verbose=True)
+    elapsed = time.time() - start_time
+    
+    print(f"\n✓ Experiment completed in {elapsed/60:.2f} minutes")
+    
+    # Create results DataFrame
+    df_results = experiment.create_results_dataframe()
+    
     print("\n" + "="*80)
-    print("✓ EXPERIMENT 3 COMPLETED")
+    print("RESULTS SUMMARY")
     print("="*80)
-    print("\nFiles generated:")
-    print("  1. experiment3_design.csv - Experimental design")
-    print("  2. experiment3_results.csv - Results")
-    print("  3. experiment3_interactions.png - Interaction plots")
+    print(df_results[['beta_level', 'capacity_level', 'objetivo', 
+                         'tasa_cumplimiento', 'pct_subcontratacion']].to_string(index=False))
+    
+    # Sum of squares and eta squared analysis
+    print("\n" + "="*80)
+    print("EFFECTS ANALYSIS - ETA SQUARED (η²)")
     print("="*80)
     
-    return results_df, analysis_results
+    for var_name, var_col in [('Net Benefit', 'objetivo'),
+                               ('Compliance Rate', 'tasa_cumplimiento'),
+                               ('Outsourcing %', 'pct_subcontratacion')]:
+        print(f"\n{var_name}:")
+        ss = experiment.calculate_sum_of_squares(var_col)
+        print(f"  η² (Tax Benefit):           {ss['eta2_beta']:.4f} ({ss['eta2_beta']*100:.2f}%)")
+        print(f"  η² (Transport Capacity):    {ss['eta2_capacity']:.4f} ({ss['eta2_capacity']*100:.2f}%)")
+        print(f"  η² (Interaction β×Cap):     {ss['eta2_interaction']:.4f} ({ss['eta2_interaction']*100:.2f}%)")
+        
+        if ss['eta2_interaction'] > 0.10:
+            print(f"  → SIGNIFICANT INTERACTION DETECTED (η² > 10%)")
+    
+    # Generate interaction plots (English labels already)
+    print("\n" + "="*80)
+    print("GENERATING INTERACTION PLOTS")
+    print("="*80)
+    experiment.generate_interaction_plots('interaction_plots.png')
+    
+    # Calculate elasticity matrix
+    experiment.calculate_elasticity_matrix()
+    
+    # Generate full report
+    print("\n" + "="*80)
+    print("GENERATING REPORTS")
+    print("="*80)
+    experiment.generate_full_report('factorial_experiment_report.txt')
+    
+    # Export to Excel
+    experiment.export_results_excel('factorial_experiment_results.xlsx')
+    
+    # Final summary
+    print("\n" + "="*80)
+    print("EXPERIMENT CONCLUSIONS")
+    print("="*80)
+    
+    # Check for interaction
+    ss_obj = experiment.calculate_sum_of_squares('objetivo')
+    
+    if ss_obj['eta2_interaction'] > 0.15:
+        print("\n✓ ALTERNATIVE HYPOTHESIS CONFIRMED:")
+        print("  There is a significant interaction between tax benefit and")
+        print("  transport capacity. The economic value of expanding the fleet")
+        print("  increases when tax incentives are higher.")
+        print("\n  → Tax incentives act as a CATALYST for investment")
+        print("    in own logistics capacity.")
+    else:
+        print("\n✓ NULL HYPOTHESIS:")
+        print("  No strong interaction between factors was detected.")
+        print("  The effects are mainly additive.")
+    
+    print("\n" + "="*80)
+    print("GENERATED FILES:")
+    print("="*80)
+    print("  1. interaction_plots.png                - Interaction plots (English)")
+    print("  2. factorial_experiment_report.txt      - Full text report")
+    print("  3. factorial_experiment_results.xlsx    - Results in Excel")
+    print("\n✓ Experiment completed successfully")
+    print("="*80 + "\n")
 
 
 if __name__ == "__main__":
-    results_df, analysis_results = main()
-
-
-
+    main()
