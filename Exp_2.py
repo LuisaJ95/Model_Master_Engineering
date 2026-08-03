@@ -1,1297 +1,584 @@
+# %% [markdown]
+# # 🧪 Experiment 2: Route Mix and Fleet Capacity Optimization
+# 
+# Full 3² Factorial Design with 3 replicas (27 total runs)
+
+# %% [markdown]
+# ## 1️⃣ Import
+
 # %%
-"""
-EXPERIMENT 2: RESPONSE SURFACE METHODOLOGY - CENTRAL COMPOSITE DESIGN (CCD)
-=============================================================================
-
-Objective: Determine optimal values for bank capacity and fleet capacity
-          to maximize donation flow without overwhelming the system.
-
-Factors:
-  X₁: Bank capacity multiplier (0.6 to 1.5) - applies to ALL banks
-  X₂: Fleet capacity (4000 to 12000 kg)
-
-Response Variables:
-  Y₁: Fulfillment rate (Total delivered / Total available)
-  Y₂: Total outsourcing cost
-
-Design: Central Composite Design with α = √2 for rotatability
-"""
-
+# %%
 import gurobipy as gp
 from gurobipy import GRB
 import json
-import numpy as np
 import pandas as pd
+import numpy as np
 import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
-from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import LinearRegression
-from sklearn.metrics import r2_score, mean_squared_error
-import itertools
+import seaborn as sns
+from itertools import product
 import time
 from copy import deepcopy
-import os
 import warnings
+import os
+
 warnings.filterwarnings('ignore')
 
-# ==============================================================================
-# OPTIMIZATION MODEL (Simplified version for experiments)
-# ==============================================================================
+# Import the model class (assuming it is in the same directory)
+from model_final import FoodDonationOptimizer
 
-class FoodDonationOptimizer:
-    """Simplified optimizer for experimental runs."""
-    
-    def __init__(self, env):
-        self.env = env
-        self.model = None
-        self.requirements = []
-        self.requirements_dict = {}
-        self.R_direct = []
-        self.R_indirect = []
-        self.T = []
-        self.B = []
-        self.P = []
-        self.beta = 0
-        self.pi = 0
-        self.c_trans = 0
-        self.alpha = 0
-        self.product_costs = {}
-        self.food_bank_capacity = {}
-        self.transport_capacity = {}
-        self.y_deliv = {}
-        self.x_out = {}
-        self.y_pickup = {}
-        self.w = {}
-    
-    def load_data_from_dict(self, data):
-        """Load data from dictionary."""
-        self.requirements = data['requirements']
-        
-        for req in self.requirements:
-            self.requirements_dict[req['id']] = req
-            req_id = req['id']
-            origin_type = req['origin_type']
-            
-            if origin_type in ['Manufacturing', 'DistributionCenter']:
-                self.R_direct.append(req_id)
-            else:
-                self.R_indirect.append(req_id)
-        
-        self.T = list(range(
-            data['planning_horizon']['start_period'],
-            data['planning_horizon']['end_period'] + 1
-        ))
-        self.B = data['sets']['food_banks']
-        self.P = data['sets']['products']
-        
-        params = data['parameters']
-        self.beta = params['beta_1']
-        self.pi = params['pi_penalty']
-        self.c_trans = params['c_trans']
-        self.alpha = params['alpha_outsource']
-        self.product_costs = params['product_costs']
-        self.food_bank_capacity = params['food_bank_capacity']
-        
-        trans_cap = params['transport_capacity_per_period']
-        self.transport_capacity = {t: trans_cap for t in self.T}
-    
-    def _get_requirement_by_id(self, req_id):
-        return self.requirements_dict.get(req_id)
-    
-    def build_model(self):
-        """Build optimization model."""
-        self.model = gp.Model("FoodDonation", env=self.env)
-        self.model.setParam('OutputFlag', 0)
-        
-        # Create variables
-        for r in self.R_direct:
-            req = self._get_requirement_by_id(r)
-            l_r = req['release_date']
-            e_r = req['expiration_date']
-            
-            for t in range(l_r, e_r + 1):
-                self.y_deliv[r, t] = self.model.addVar(lb=0, vtype=GRB.CONTINUOUS)
-                self.x_out[r, t] = self.model.addVar(lb=0, vtype=GRB.CONTINUOUS)
-        
-        for r in self.R_indirect:
-            req = self._get_requirement_by_id(r)
-            l_r = req['release_date']
-            e_r = req['expiration_date']
-            
-            for t in range(l_r, e_r):
-                self.y_pickup[r, t] = self.model.addVar(lb=0, vtype=GRB.CONTINUOUS)
-            
-            for t in range(l_r + 1, e_r + 1):
-                self.y_deliv[r, t] = self.model.addVar(lb=0, vtype=GRB.CONTINUOUS)
-        
-        for r in self.R_direct + self.R_indirect:
-            self.w[r] = self.model.addVar(lb=0, vtype=GRB.CONTINUOUS)
-        
-        self.model.update()
-        
-        # Set objective
-        self._set_objective()
-        
-        # Add constraints
-        self._add_constraints()
-        
-        self.model.update()
-    
-    def _set_objective(self):
-        """Set objective function."""
-        obj_terms = []
-        
-        # Tax benefits and costs for direct requirements
-        for r in self.R_direct:
-            req = self._get_requirement_by_id(r)
-            product = req['product']
-            c_prod = self.product_costs.get(product, 0)
-            dist = req['distance']
-            l_r = req['release_date']
-            e_r = req['expiration_date']
-            
-            for t in range(l_r, e_r + 1):
-                y_val = self.y_deliv[r, t]
-                x_val = self.x_out[r, t]
-                
-                # Tax benefit on product value
-                obj_terms.append(self.beta * c_prod * (y_val + x_val))
-                
-                # Tax benefit on transport
-                obj_terms.append(self.beta * self.c_trans * dist * (y_val + self.alpha * x_val))
-                
-                # Transport costs
-                obj_terms.append(-self.c_trans * dist * y_val)
-                
-                # Outsourcing costs
-                obj_terms.append(-self.alpha * self.c_trans * dist * x_val)
-        
-        # Tax benefits and costs for indirect requirements
-        for r in self.R_indirect:
-            req = self._get_requirement_by_id(r)
-            product = req['product']
-            c_prod = self.product_costs.get(product, 0)
-            dist_indir = req['dist_indirect']
-            l_r = req['release_date']
-            e_r = req['expiration_date']
-            
-            for t in range(l_r + 1, e_r + 1):
-                y_val = self.y_deliv[r, t]
-                
-                # Tax benefit on product value
-                obj_terms.append(self.beta * c_prod * y_val)
-                
-                # Tax benefit on transport
-                obj_terms.append(self.beta * self.c_trans * dist_indir * y_val)
-                
-                # Transport costs
-                obj_terms.append(-self.c_trans * dist_indir * y_val)
-        
-        # Waste penalties
-        for r in self.R_direct + self.R_indirect:
-            obj_terms.append(-self.pi * self.w[r])
-        
-        self.model.setObjective(gp.quicksum(obj_terms), GRB.MAXIMIZE)
-    
-    def _add_constraints(self):
-        """Add constraints."""
-        # Flow conservation - Direct
-        for r in self.R_direct:
-            req = self._get_requirement_by_id(r)
-            q_r = req['quantity']
-            l_r = req['release_date']
-            e_r = req['expiration_date']
-            
-            self.model.addConstr(
-                gp.quicksum(self.y_deliv[r, t] + self.x_out[r, t] for t in range(l_r, e_r + 1)) + 
-                self.w[r] == q_r
-            )
-        
-        # Flow conservation - Indirect
-        for r in self.R_indirect:
-            req = self._get_requirement_by_id(r)
-            q_r = req['quantity']
-            l_r = req['release_date']
-            e_r = req['expiration_date']
-            
-            self.model.addConstr(
-                gp.quicksum(self.y_deliv[r, t] for t in range(l_r + 1, e_r + 1)) + 
-                self.w[r] == q_r
-            )
-        
-        # Food bank capacity
-        direct_reqs_by_bank = {j: [] for j in self.B}
-        indirect_reqs_by_bank = {j: [] for j in self.B}
-        
-        for r in self.R_direct:
-            req = self._get_requirement_by_id(r)
-            dest = req['destination']
-            if dest in direct_reqs_by_bank:
-                direct_reqs_by_bank[dest].append(r)
-        
-        for r in self.R_indirect:
-            req = self._get_requirement_by_id(r)
-            dest = req['destination']
-            if dest in indirect_reqs_by_bank:
-                indirect_reqs_by_bank[dest].append(r)
-        
-        for j in self.B:
-            cap_j = self.food_bank_capacity.get(j, 0)
-            
-            for t in self.T:
-                deliveries = []
-                
-                for r in direct_reqs_by_bank[j]:
-                    req = self._get_requirement_by_id(r)
-                    l_r = req['release_date']
-                    e_r = req['expiration_date']
-                    if l_r <= t <= e_r:
-                        deliveries.append(self.y_deliv[r, t] + self.x_out[r, t])
-                
-                for r in indirect_reqs_by_bank[j]:
-                    req = self._get_requirement_by_id(r)
-                    l_r = req['release_date']
-                    e_r = req['expiration_date']
-                    if l_r + 1 <= t <= e_r:
-                        deliveries.append(self.y_deliv[r, t])
-                
-                if deliveries:
-                    self.model.addConstr(gp.quicksum(deliveries) <= cap_j)
-        
-        # Transport capacity
-        for t in self.T:
-            cap_trans = self.transport_capacity[t]
-            fleet_usage = []
-            
-            for r in self.R_direct:
-                req = self._get_requirement_by_id(r)
-                l_r = req['release_date']
-                e_r = req['expiration_date']
-                if l_r <= t <= e_r:
-                    fleet_usage.append(self.y_deliv[r, t])
-            
-            for r in self.R_indirect:
-                req = self._get_requirement_by_id(r)
-                l_r = req['release_date']
-                e_r = req['expiration_date']
-                if l_r <= t < e_r:
-                    fleet_usage.append(self.y_pickup[r, t])
-                if l_r + 1 <= t <= e_r:
-                    fleet_usage.append(self.y_deliv[r, t])
-            
-            if fleet_usage:
-                self.model.addConstr(gp.quicksum(fleet_usage) <= cap_trans)
-        
-        # Synchronization - Indirect
-        for r in self.R_indirect:
-            req = self._get_requirement_by_id(r)
-            l_r = req['release_date']
-            e_r = req['expiration_date']
-            
-            for t in range(l_r, e_r):
-                self.model.addConstr(self.y_pickup[r, t] == self.y_deliv[r, t + 1])
-    
-    def optimize(self):
-        """Solve the model."""
-        self.model.optimize()
-        return self.model.Status
-    
-    def get_metrics(self):
-        """Extract metrics from solution."""
-        if self.model.Status not in [GRB.OPTIMAL, GRB.TIME_LIMIT]:
-            return None
-        
-        if self.model.SolCount == 0:
-            return None
-        
-        metrics = {
-            'objective_value': self.model.ObjVal,
-            'total_donated': 0,
-            'total_wasted': 0,
-            'total_outsourced': 0,
-            'total_available': 0,
-            'fulfillment_rate': 0,
-            'outsourcing_cost': 0
-        }
-        
-        # Calculate totals
-        for r in self.R_direct:
-            req = self._get_requirement_by_id(r)
-            metrics['total_available'] += req['quantity']
-            l_r = req['release_date']
-            e_r = req['expiration_date']
-            dist = req['distance']
-            
-            for t in range(l_r, e_r + 1):
-                y_val = self.y_deliv[r, t].X
-                x_val = self.x_out[r, t].X
-                metrics['total_donated'] += (y_val + x_val)
-                metrics['total_outsourced'] += x_val
-                metrics['outsourcing_cost'] += self.alpha * self.c_trans * dist * x_val
-        
-        for r in self.R_indirect:
-            req = self._get_requirement_by_id(r)
-            metrics['total_available'] += req['quantity']
-            l_r = req['release_date']
-            e_r = req['expiration_date']
-            
-            for t in range(l_r + 1, e_r + 1):
-                y_val = self.y_deliv[r, t].X
-                metrics['total_donated'] += y_val
-        
-        for r in self.R_direct + self.R_indirect:
-            metrics['total_wasted'] += self.w[r].X
-        
-        # Calculate fulfillment rate
-        if metrics['total_available'] > 0:
-            metrics['fulfillment_rate'] = (metrics['total_donated'] / metrics['total_available']) * 100
-        
-        return metrics
+print("✓ Libraries imported")
 
+# %% [markdown]
+# ## 2️⃣ Experimental Design Configuration
 
-# ==============================================================================
-# EXPERIMENTAL DESIGN AND SIMULATION
-# ==============================================================================
-
-class ExperimentCCD:
-    """Central Composite Design experiment manager."""
+# %%
+class ExperimentDesign:
+    """
+    Factorial Design 3² for Food Donation Optimization
     
-    def __init__(self, factors, num_replicates=3):
+    Factors:
+    - X1: Fleet capacity (5,000 / 10,000 / 15,000 kg)
+    - X2: % Indirect requirements (20% / 50% / 80%)
+    
+    Response Variables:
+    - Y1: Net benefit (USD)
+    - Y2: Fulfillment rate (%)
+    - Y3: Outsourcing cost (USD)
+    - Y4: Waste rate (%)
+    - Y5: Days with fleet saturation (days)
+    """
+    
+    def __init__(self, base_instance_file):
         """
-        Initialize CCD experiment.
+        Initialize experimental design.
         
         Args:
-            factors: Dictionary with factor names and (min, max) ranges
-            num_replicates: Number of replicate runs at each design point
+            base_instance_file: Path to base JSON instance file
         """
-        self.factors = factors
-        self.factor_names = list(factors.keys())
-        self.num_factors = len(factors)
-        self.num_replicates = num_replicates
-        
-        # Design parameters
-        self.alpha = np.sqrt(self.num_factors)  # For rotatability
-        
-        # Design points
-        self.design_matrix = None
-        self.design_matrix_coded = None
-        
-        # Results storage
-        self.results = []
-    
-    def generate_design(self):
-        """Generate Central Composite Design."""
-        print("\n" + "="*80)
-        print("GENERATING CENTRAL COMPOSITE DESIGN")
-        print("="*80)
-        
-        # Factorial points (2^k corners of cube)
-        factorial_coded = list(itertools.product([-1, 1], repeat=self.num_factors))
-        factorial_points = np.array(factorial_coded)
-        
-        # Axial points (star points)
-        axial_points = []
-        for i in range(self.num_factors):
-            point_plus = np.zeros(self.num_factors)
-            point_plus[i] = self.alpha
-            axial_points.append(point_plus)
-            
-            point_minus = np.zeros(self.num_factors)
-            point_minus[i] = -self.alpha
-            axial_points.append(point_minus)
-        axial_points = np.array(axial_points)
-        
-        # Center points
-        num_center = max(5, self.num_factors + 1)  # At least 5 center points
-        center_points = np.zeros((num_center, self.num_factors))
-        
-        # Combine all points
-        self.design_matrix_coded = np.vstack([
-            factorial_points,
-            axial_points,
-            center_points
-        ])
-        
-        # Convert coded values to natural units
-        self.design_matrix = self._decode_design(self.design_matrix_coded)
-        
-        print(f"\n✓ Design generated:")
-        print(f"  - Factorial points: {len(factorial_points)}")
-        print(f"  - Axial points: {len(axial_points)}")
-        print(f"  - Center points: {len(center_points)}")
-        print(f"  - Total design points: {len(self.design_matrix)}")
-        print(f"  - Alpha (for rotatability): {self.alpha:.4f}")
-        print(f"  - Replicates per point: {self.num_replicates}")
-        print(f"  - Total experimental runs: {len(self.design_matrix) * self.num_replicates}")
-        
-        return self.design_matrix
-    
-    def _decode_design(self, coded_matrix):
-        """Convert coded design matrix to natural units."""
-        natural_matrix = np.zeros_like(coded_matrix)
-        
-        for i, factor_name in enumerate(self.factor_names):
-            low, high = self.factors[factor_name]
-            center = (high + low) / 2
-            radius = (high - low) / 2
-            
-            natural_matrix[:, i] = center + radius * coded_matrix[:, i]
-        
-        return natural_matrix
-    
-    def _encode_design(self, natural_matrix):
-        """Convert natural units to coded design matrix."""
-        coded_matrix = np.zeros_like(natural_matrix)
-        
-        for i, factor_name in enumerate(self.factor_names):
-            low, high = self.factors[factor_name]
-            center = (high + low) / 2
-            radius = (high - low) / 2
-            
-            coded_matrix[:, i] = (natural_matrix[:, i] - center) / radius
-        
-        return coded_matrix
-    
-    def save_design(self, filename='experimental_design_ccd.csv'):
-        """Save design matrix to CSV."""
-        if self.design_matrix is None:
-            print("⚠️ No design matrix to save. Generate design first.")
-            return
-        
-        # Create DataFrame
-        df_natural = pd.DataFrame(self.design_matrix, columns=self.factor_names)
-        df_coded = pd.DataFrame(self.design_matrix_coded, 
-                               columns=[f"{name}_coded" for name in self.factor_names])
-        
-        # Add design point type
-        num_factorial = 2**self.num_factors
-        num_axial = 2 * self.num_factors
-        num_center = len(self.design_matrix) - num_factorial - num_axial
-        
-        point_types = (['Factorial'] * num_factorial + 
-                      ['Axial'] * num_axial + 
-                      ['Center'] * num_center)
-        
-        df = pd.concat([
-            pd.DataFrame({'run': range(1, len(self.design_matrix) + 1),
-                         'point_type': point_types}),
-            df_natural,
-            df_coded
-        ], axis=1)
-        
-        df.to_csv(filename, index=False)
-        print(f"\n✓ Design matrix saved to: {filename}")
-        
-        return df
-    
-    def visualize_design(self, filename='ccd_design_plot.png'):
-        """Visualize the design in 2D."""
-        if self.design_matrix_coded is None:
-            print("⚠️ No design to visualize. Generate design first.")
-            return
-        
-        fig, ax = plt.subplots(figsize=(10, 8))
-        
-        # Identify point types
-        num_factorial = 2**self.num_factors
-        num_axial = 2 * self.num_factors
-        
-        factorial_idx = slice(0, num_factorial)
-        axial_idx = slice(num_factorial, num_factorial + num_axial)
-        center_idx = slice(num_factorial + num_axial, None)
-        
-        # Plot points
-        ax.scatter(self.design_matrix_coded[factorial_idx, 0],
-                  self.design_matrix_coded[factorial_idx, 1],
-                  s=150, c='red', marker='s', label='Factorial', edgecolors='black', linewidth=2)
-        
-        ax.scatter(self.design_matrix_coded[axial_idx, 0],
-                  self.design_matrix_coded[axial_idx, 1],
-                  s=150, c='blue', marker='^', label='Axial', edgecolors='black', linewidth=2)
-        
-        ax.scatter(self.design_matrix_coded[center_idx, 0],
-                  self.design_matrix_coded[center_idx, 1],
-                  s=150, c='green', marker='o', label='Center', edgecolors='black', linewidth=2)
-        
-        # Add grid
-        ax.grid(True, alpha=0.3)
-        ax.axhline(y=0, color='k', linewidth=0.5)
-        ax.axvline(x=0, color='k', linewidth=0.5)
-        
-        # Labels and legend
-        ax.set_xlabel(f'{self.factor_names[0]} (coded)', fontsize=12, fontweight='bold')
-        ax.set_ylabel(f'{self.factor_names[1]} (coded)', fontsize=12, fontweight='bold')
-        ax.set_title('Central Composite Design (CCD) - Coded Units', fontsize=14, fontweight='bold')
-        ax.legend(fontsize=10, loc='best')
-        
-        # Set equal aspect ratio
-        ax.set_aspect('equal', adjustable='box')
-        
-        plt.tight_layout()
-        plt.savefig(filename, dpi=300, bbox_inches='tight')
-        print(f"\n✓ Design visualization saved to: {filename}")
-        plt.close()
-
-
-class OptimizationSimulator:
-    """Run optimization simulations for experimental design."""
-    
-    def __init__(self, data_file, num_replicates=3):
-        """
-        Initialize simulator.
-        
-        Args:
-            data_file: Path to JSON data file
-            num_replicates: Number of replicate runs per design point
-        """
-        self.data_file = data_file
-        self.num_replicates = num_replicates
+        self.base_instance_file = base_instance_file
         
         # Load base instance
-        with open(data_file, 'r', encoding='utf-8') as f:
-            self.base_instance = json.load(f)
+        with open(base_instance_file, 'r', encoding='utf-8') as f:
+            self.base_data = json.load(f)
         
-        print(f"\n✓ Base instance loaded from: {data_file}")
-        print(f"  - Total requirements: {len(self.base_instance['requirements'])}")
-        print(f"  - Food banks: {len(self.base_instance['sets']['food_banks'])}")
-        print(f"  - Base fleet capacity: {self.base_instance['parameters']['transport_capacity_per_period']} kg")
+        # Define factor levels
+        self.factor_levels = {
+            'fleet_capacity': [5000, 10000, 15000],
+            'indirect_percentage': [20, 50, 80]
+        }
         
-        # Show current bank capacities
-        print(f"  - Bank capacities:")
-        total_bank_cap = 0
-        for bank, cap in self.base_instance['parameters']['food_bank_capacity'].items():
-            print(f"      {bank}: {cap:,.0f} kg")
-            total_bank_cap += cap
-        print(f"      TOTAL: {total_bank_cap:,.0f} kg")
+        # Generate experimental matrix
+        self.n_replicas = 3
+        self.experimental_runs = self._generate_experimental_matrix()
+        
+        # Storage for results
+        self.results = []
+        
+        print(f"✓ Experimental design initialized")
+        print(f"  - Total runs: {len(self.experimental_runs)}")
+        print(f"  - Factors: 2")
+        print(f"  - Levels per factor: 3")
+        print(f"  - Replicas: {self.n_replicas}")
     
-    def modify_instance(self, factor_values):
-        """
-        Modify instance with experimental factor values.
+    def _generate_experimental_matrix(self):
+        """Generate the full factorial design with replicas."""
+        runs = []
+        run_id = 1
         
-        Args:
-            factor_values: Dictionary with factor names and values
-                          e.g., {'X1_bank_capacity_multiplier': 1.2, 'X2_fleet_capacity': 10000}
+        for replica in range(1, self.n_replicas + 1):
+            for fleet_cap in self.factor_levels['fleet_capacity']:
+                for indirect_pct in self.factor_levels['indirect_percentage']:
+                    runs.append({
+                        'run_id': run_id,
+                        'replica': replica,
+                        'fleet_capacity': fleet_cap,
+                        'indirect_percentage': indirect_pct,
+                        'fleet_level': self._encode_level(fleet_cap, 'fleet_capacity'),
+                        'indirect_level': self._encode_level(indirect_pct, 'indirect_percentage')
+                    })
+                    run_id += 1
         
-        Returns:
-            Modified instance dictionary
-        """
-        modified = deepcopy(self.base_instance)
-        
-        # Extract factor values
-        bank_multiplier = factor_values.get('X1_bank_capacity_multiplier', 1.0)
-        fleet_capacity = factor_values.get('X2_fleet_capacity', 8000)
-        
-        # Apply multiplier to ALL food bank capacities
-        for bank_id in modified['parameters']['food_bank_capacity'].keys():
-            original_capacity = modified['parameters']['food_bank_capacity'][bank_id]
-            modified['parameters']['food_bank_capacity'][bank_id] = original_capacity * bank_multiplier
-        
-        # Set fleet capacity
-        modified['parameters']['transport_capacity_per_period'] = fleet_capacity
-        
-        return modified
+        return runs
     
-    def run_single_simulation(self, factor_values, run_id, env):
-        """
-        Run a single optimization simulation.
-        
-        Args:
-            factor_values: Dictionary with factor names and values
-            run_id: Run identifier
-            env: Gurobi environment
-        
-        Returns:
-            Dictionary with results
-        """
-        # Modify instance
-        instance = self.modify_instance(factor_values)
-        
-        # Create and solve model
-        optimizer = FoodDonationOptimizer(env)
-        optimizer.load_data_from_dict(instance)
-        optimizer.build_model()
-        
-        start_time = time.time()
-        status = optimizer.optimize()
-        solve_time = time.time() - start_time
-        
-        # Extract metrics
-        if status == GRB.OPTIMAL:
-            metrics = optimizer.get_metrics()
-            
-            result = {
-                'run_id': run_id,
-                'status': 'Optimal',
-                'Y1_fulfillment_rate': metrics['fulfillment_rate'],
-                'Y2_outsourcing_cost': metrics['outsourcing_cost'],
-                'objective_value': metrics['objective_value'],
-                'total_donated': metrics['total_donated'],
-                'total_wasted': metrics['total_wasted'],
-                'total_outsourced': metrics['total_outsourced'],
-                'solve_time': solve_time
-            }
-            # Add factor values to result (this ensures correct column names)
-            result.update(factor_values)
+    def _encode_level(self, value, factor):
+        """Encode factor level as -1, 0, +1."""
+        levels = self.factor_levels[factor]
+        if value == levels[0]:
+            return -1
+        elif value == levels[1]:
+            return 0
         else:
-            result = {
-                'run_id': run_id,
-                'status': f'Status_{status}',
-                'Y1_fulfillment_rate': np.nan,
-                'Y2_outsourcing_cost': np.nan,
-                'objective_value': np.nan,
-                'total_donated': np.nan,
-                'total_wasted': np.nan,
-                'total_outsourced': np.nan,
-                'solve_time': solve_time
-            }
-            # Add factor values to result
-            result.update(factor_values)
-        
-        # Clean up
-        optimizer.model.dispose()
-        
-        return result
+            return 1
     
-    def run_experiment(self, design_matrix, factor_names):
+    def _ensure_required_keys(self, data):
         """
-        Run full experimental design.
-        
-        Args:
-            design_matrix: Matrix of design points (natural units)
-            factor_names: List of factor names
-        
-        Returns:
-            DataFrame with all results
+        Ensure all requirements have 'distance' (for direct) and 'dist_indirect' (for indirect).
+        If missing, calculate from the other or set default values.
         """
-        print("\n" + "="*80)
-        print("RUNNING EXPERIMENTAL SIMULATIONS")
-        print("="*80)
-        
-        results = []
-        total_runs = len(design_matrix) * self.num_replicates
-        run_counter = 0
-        
-        # Create Gurobi environment
-        with gp.Env(empty=True) as env:
-            env.setParam('OutputFlag', 0)
-            env.setParam('TimeLimit', 300)  # 5 minutes max per run
-            env.setParam('MIPFocus', 1)
-            env.setParam('Threads', 2)
-            env.start()
+        for req in data['requirements']:
+            origin = req['origin_type']
             
-            # Run each design point with replicates
-            for point_idx, design_point in enumerate(design_matrix):
-                # Create factor values dictionary
-                factor_values = {factor_names[i]: design_point[i] for i in range(len(factor_names))}
-                
-                print(f"\n{'='*80}")
-                print(f"Design Point {point_idx + 1}/{len(design_matrix)}")
-                print(f"{'='*80}")
-                for fname, fval in factor_values.items():
-                    print(f"  {fname}: {fval:.4f}")
-                
-                # Run replicates
-                for rep in range(self.num_replicates):
-                    run_counter += 1
-                    run_id = f"P{point_idx+1}_R{rep+1}"
-                    
-                    print(f"\n  Run {run_counter}/{total_runs} (Replicate {rep+1}/{self.num_replicates})...", end=' ')
-                    
-                    result = self.run_single_simulation(
-                        factor_values, run_id, env
-                    )
-                    
-                    results.append(result)
-                    
-                    if result['status'] == 'Optimal':
-                        print(f"✓ Y₁={result['Y1_fulfillment_rate']:.2f}% Y₂=${result['Y2_outsourcing_cost']:.2f}")
+            # For direct: must have 'distance'
+            if origin in ['Manufacturing', 'DistributionCenter']:
+                if 'distance' not in req:
+                    if 'dist_indirect' in req:
+                        req['distance'] = req['dist_indirect'] / 1.4
                     else:
-                        print(f"✗ {result['status']}")
+                        req['distance'] = 100.0  # default value (adjustable)
+                # If it has dist_indirect, remove it to avoid confusion
+                if 'dist_indirect' in req:
+                    del req['dist_indirect']
+            
+            # For indirect (Client): must have 'dist_indirect'
+            elif origin == 'Client':
+                if 'dist_indirect' not in req:
+                    if 'distance' in req:
+                        req['dist_indirect'] = req['distance'] * 1.4
+                    else:
+                        req['dist_indirect'] = 140.0  # default value
+                # Ensure they also have 'distance' (just in case)
+                if 'distance' not in req:
+                    req['distance'] = req['dist_indirect'] / 1.4
         
-        # Create DataFrame
-        df_results = pd.DataFrame(results)
-        
-        print("\n" + "="*80)
-        print("EXPERIMENTAL RUNS COMPLETED")
-        print("="*80)
-        print(f"  Total runs: {len(df_results)}")
-        print(f"  Successful: {(df_results['status'] == 'Optimal').sum()}")
-        print(f"  Failed: {(df_results['status'] != 'Optimal').sum()}")
-        
-        return df_results
-
-
-# ==============================================================================
-# RESPONSE SURFACE ANALYSIS
-# ==============================================================================
-
-class ResponseSurfaceAnalysis:
-    """Analyze experimental results and fit response surface."""
+        return data
     
-    def __init__(self, results_df, factors):
+    def _create_instance_for_run(self, run_config):
         """
-        Initialize analysis.
+        Create a modified instance for a specific experimental run.
         
         Args:
-            results_df: DataFrame with experimental results
-            factors: Dictionary with factor names and ranges
-        """
-        self.results_df = results_df
-        self.factors = factors
-        self.factor_names = list(factors.keys())
-        
-        # Models
-        self.model_Y1 = None
-        self.model_Y2 = None
-        
-        # Coefficients
-        self.coef_Y1 = None
-        self.coef_Y2 = None
-        
-        # Statistics
-        self.stats_Y1 = {}
-        self.stats_Y2 = {}
-    
-    def prepare_data(self):
-        """Prepare data for regression analysis."""
-        # Filter only successful runs
-        df = self.results_df[self.results_df['status'] == 'Optimal'].copy()
-        
-        if len(df) == 0:
-            raise ValueError("No successful optimization runs to analyze!")
-        
-        # Extract factors (natural units)
-        X_natural = df[self.factor_names].values
-        
-        # Convert to coded units
-        X_coded = self._encode_to_coded(X_natural)
-        
-        # Create design matrix for quadratic model
-        # [1, X1, X2, X1², X2², X1*X2]
-        X1 = X_coded[:, 0]
-        X2 = X_coded[:, 1]
-        
-        X_design = np.column_stack([
-            np.ones(len(X1)),  # Intercept
-            X1,                # Linear X1
-            X2,                # Linear X2
-            X1**2,             # Quadratic X1
-            X2**2,             # Quadratic X2
-            X1*X2              # Interaction
-        ])
-        
-        # Response variables
-        Y1 = df['Y1_fulfillment_rate'].values
-        Y2 = df['Y2_outsourcing_cost'].values
-        
-        return X_design, X_coded, X_natural, Y1, Y2
-    
-    def _encode_to_coded(self, X_natural):
-        """Convert natural units to coded units."""
-        X_coded = np.zeros_like(X_natural)
-        
-        for i, factor_name in enumerate(self.factor_names):
-            low, high = self.factors[factor_name]
-            center = (high + low) / 2
-            radius = (high - low) / 2
+            run_config: Dictionary with run configuration
             
-            X_coded[:, i] = (X_natural[:, i] - center) / radius
-        
-        return X_coded
-    
-    def _decode_to_natural(self, X_coded):
-        """Convert coded units to natural units."""
-        X_natural = np.zeros_like(X_coded)
-        
-        for i, factor_name in enumerate(self.factor_names):
-            low, high = self.factors[factor_name]
-            center = (high + low) / 2
-            radius = (high - low) / 2
-            
-            X_natural[:, i] = center + radius * X_coded[:, i]
-        
-        return X_natural
-    
-    def fit_models(self):
-        """Fit quadratic response surface models."""
-        print("\n" + "="*80)
-        print("FITTING QUADRATIC RESPONSE SURFACE MODELS")
-        print("="*80)
-        
-        X_design, X_coded, X_natural, Y1, Y2 = self.prepare_data()
-        
-        # Fit model for Y1 (Fulfillment Rate)
-        self.model_Y1 = LinearRegression()
-        self.model_Y1.fit(X_design, Y1)
-        Y1_pred = self.model_Y1.predict(X_design)
-        
-        self.coef_Y1 = {
-            'β0': self.model_Y1.intercept_,
-            'β1': self.model_Y1.coef_[1],
-            'β2': self.model_Y1.coef_[2],
-            'β11': self.model_Y1.coef_[3],
-            'β22': self.model_Y1.coef_[4],
-            'β12': self.model_Y1.coef_[5]
-        }
-        
-        self.stats_Y1 = {
-            'R2': r2_score(Y1, Y1_pred),
-            'R2_adj': 1 - (1 - r2_score(Y1, Y1_pred)) * (len(Y1) - 1) / (len(Y1) - 6),
-            'RMSE': np.sqrt(mean_squared_error(Y1, Y1_pred))
-        }
-        
-        # Fit model for Y2 (Outsourcing Cost)
-        self.model_Y2 = LinearRegression()
-        self.model_Y2.fit(X_design, Y2)
-        Y2_pred = self.model_Y2.predict(X_design)
-        
-        self.coef_Y2 = {
-            'β0': self.model_Y2.intercept_,
-            'β1': self.model_Y2.coef_[1],
-            'β2': self.model_Y2.coef_[2],
-            'β11': self.model_Y2.coef_[3],
-            'β22': self.model_Y2.coef_[4],
-            'β12': self.model_Y2.coef_[5]
-        }
-        
-        self.stats_Y2 = {
-            'R2': r2_score(Y2, Y2_pred),
-            'R2_adj': 1 - (1 - r2_score(Y2, Y2_pred)) * (len(Y2) - 1) / (len(Y2) - 6),
-            'RMSE': np.sqrt(mean_squared_error(Y2, Y2_pred))
-        }
-        
-        # Display results
-        print("\n" + "─"*80)
-        print("MODEL FOR Y₁ (FULFILLMENT RATE)")
-        print("─"*80)
-        print(f"\nRegression Equation (coded units):")
-        print(f"  Y₁ = {self.coef_Y1['β0']:.4f}")
-        print(f"       {self.coef_Y1['β1']:+.4f}·X₁")
-        print(f"       {self.coef_Y1['β2']:+.4f}·X₂")
-        print(f"       {self.coef_Y1['β11']:+.4f}·X₁²")
-        print(f"       {self.coef_Y1['β22']:+.4f}·X₂²")
-        print(f"       {self.coef_Y1['β12']:+.4f}·X₁·X₂")
-        
-        print(f"\nModel Statistics:")
-        print(f"  R²:          {self.stats_Y1['R2']:.4f}")
-        print(f"  R² adjusted: {self.stats_Y1['R2_adj']:.4f}")
-        print(f"  RMSE:        {self.stats_Y1['RMSE']:.4f}")
-        
-        print("\n" + "─"*80)
-        print("MODEL FOR Y₂ (OUTSOURCING COST)")
-        print("─"*80)
-        print(f"\nRegression Equation (coded units):")
-        print(f"  Y₂ = {self.coef_Y2['β0']:.4f}")
-        print(f"       {self.coef_Y2['β1']:+.4f}·X₁")
-        print(f"       {self.coef_Y2['β2']:+.4f}·X₂")
-        print(f"       {self.coef_Y2['β11']:+.4f}·X₁²")
-        print(f"       {self.coef_Y2['β22']:+.4f}·X₂²")
-        print(f"       {self.coef_Y2['β12']:+.4f}·X₁·X₂")
-        
-        print(f"\nModel Statistics:")
-        print(f"  R²:          {self.stats_Y2['R2']:.4f}")
-        print(f"  R² adjusted: {self.stats_Y2['R2_adj']:.4f}")
-        print(f"  RMSE:        {self.stats_Y2['RMSE']:.4f}")
-    
-    def find_stationary_point(self, response='Y1'):
-        """
-        Find stationary point of response surface.
-        
-        Args:
-            response: 'Y1' or 'Y2'
-        
         Returns:
-            Dictionary with stationary point analysis
+            Modified data dictionary with all required keys
         """
-        print("\n" + "="*80)
-        print(f"STATIONARY POINT ANALYSIS FOR {response}")
-        print("="*80)
+        # Deep copy base data
+        data = deepcopy(self.base_data)
         
-        # Select coefficients
-        if response == 'Y1':
-            coef = self.coef_Y1
-        else:
-            coef = self.coef_Y2
+        # 1. Modify fleet capacity
+        fleet_capacity = run_config['fleet_capacity']
+        data['parameters']['transport_capacity_per_period'] = fleet_capacity
         
-        # Compute stationary point (coded units)
-        # Solve: ∂Y/∂X₁ = 0 and ∂Y/∂X₂ = 0
+        # 2. Reclassify requirements according to indirect percentage
+        indirect_pct = run_config['indirect_percentage']
+        data = self._reclassify_requirements(data, indirect_pct, run_config['replica'])
         
-        # β₁ + 2β₁₁·X₁ + β₁₂·X₂ = 0
-        # β₂ + 2β₂₂·X₂ + β₁₂·X₁ = 0
+        # 3. Ensure all required keys exist
+        data = self._ensure_required_keys(data)
         
-        # Matrix form: [2β₁₁  β₁₂ ] [X₁]   [-β₁]
-        #              [β₁₂  2β₂₂] [X₂] = [-β₂]
+        return data
+    
+    def _reclassify_requirements(self, data, indirect_pct, seed):
+        """
+        Reclassify Client requirements as direct or indirect based on target percentage.
         
-        A = np.array([
-            [2 * coef['β11'], coef['β12']],
-            [coef['β12'], 2 * coef['β22']]
-        ])
+        IMPORTANT: This method MODIFIES 'origin_type' and ensures proper keys.
+        """
+        np.random.seed(seed * 1000 + indirect_pct)
+        requirements = data['requirements']
         
-        b = np.array([-coef['β1'], -coef['β2']])
+        # First, ensure all Clients have 'distance' (to use later)
+        for req in requirements:
+            if req['origin_type'] == 'Client' and 'distance' not in req:
+                if 'dist_indirect' in req:
+                    req['distance'] = req['dist_indirect'] / 1.4
+                else:
+                    req['distance'] = 100.0  # default
         
-        try:
-            X_stat_coded = np.linalg.solve(A, b)
-        except np.linalg.LinAlgError:
-            print("⚠️ Singular matrix - no unique stationary point")
+        # Select clients
+        clients = [r for r in requirements if r['origin_type'] == 'Client']
+        n_total = len(clients)
+        n_indirect = int(n_total * indirect_pct / 100)
+        
+        # Randomly choose which ones will be indirect
+        np.random.shuffle(clients)
+        indirect_ids = {req['id'] for req in clients[:n_indirect]}
+        
+        # Reclassify
+        for req in requirements:
+            if req['origin_type'] == 'Client':
+                if req['id'] in indirect_ids:
+                    # Keep as indirect: ensure dist_indirect
+                    if 'dist_indirect' not in req:
+                        req['dist_indirect'] = req['distance'] * 1.4
+                else:
+                    # Convert to direct
+                    req['origin_type'] = 'DistributionCenter'  # or 'Manufacturing'
+                    # Ensure it has 'distance' (it should already)
+                    if 'distance' not in req:
+                        req['distance'] = req.get('dist_indirect', 100.0) / 1.4
+                    # Remove dist_indirect if it exists
+                    if 'dist_indirect' in req:
+                        del req['dist_indirect']
+        
+        return data
+    
+    def _calculate_response_variables(self, optimizer, run_config):
+        """
+        Calculate all response variables from optimized model.
+        """
+        if optimizer.model.Status not in [GRB.OPTIMAL, GRB.TIME_LIMIT]:
             return None
         
-        # Convert to natural units
-        X_stat_natural = self._decode_to_natural(X_stat_coded.reshape(1, -1))[0]
+        if optimizer.model.SolCount == 0:
+            return None
         
-        # Predict response at stationary point
-        X_design_stat = np.array([
-            1,
-            X_stat_coded[0],
-            X_stat_coded[1],
-            X_stat_coded[0]**2,
-            X_stat_coded[1]**2,
-            X_stat_coded[0] * X_stat_coded[1]
-        ]).reshape(1, -1)
+        metrics = optimizer._calculate_metrics()
         
-        if response == 'Y1':
-            Y_stat = self.model_Y1.predict(X_design_stat)[0]
-        else:
-            Y_stat = self.model_Y2.predict(X_design_stat)[0]
+        Y1 = optimizer.model.ObjVal
+        Y2 = metrics['donation_rate']
+        Y3 = metrics['outsourcing_costs']
+        Y4 = (metrics['total_wasted'] / metrics['total_available'] * 100) if metrics['total_available'] > 0 else 0
         
-        # Classify stationary point using eigenvalues of Hessian
-        # Hessian = [2β₁₁  β₁₂ ]
-        #           [β₁₂  2β₂₂]
+        # Y5: Days with Fleet Saturation
+        Y5 = 0
+        fleet_capacity = run_config['fleet_capacity']
         
-        eigenvalues = np.linalg.eigvalsh(A)
+        for t in optimizer.T:
+            fleet_usage = 0
+            
+            # Direct deliveries
+            for r in optimizer.R_direct:
+                req = optimizer._get_requirement_by_id(r)
+                l_r = req['release_date']
+                e_r = req['expiration_date']
+                if l_r <= t <= e_r and (r, t) in optimizer.y_deliv:
+                    fleet_usage += optimizer.y_deliv[r, t].X
+            
+            # Indirect pickups
+            for r in optimizer.R_indirect:
+                req = optimizer._get_requirement_by_id(r)
+                l_r = req['release_date']
+                e_r = req['expiration_date']
+                if l_r <= t < e_r and (r, t) in optimizer.y_pickup:
+                    fleet_usage += optimizer.y_pickup[r, t].X
+            
+            # Indirect deliveries
+            for r in optimizer.R_indirect:
+                req = optimizer._get_requirement_by_id(r)
+                l_r = req['release_date']
+                e_r = req['expiration_date']
+                if l_r + 1 <= t <= e_r and (r, t) in optimizer.y_deliv:
+                    fleet_usage += optimizer.y_deliv[r, t].X
+            
+            if fleet_usage >= 0.95 * fleet_capacity:
+                Y5 += 1
         
-        if all(eigenvalues > 0):
-            point_type = "Minimum"
-        elif all(eigenvalues < 0):
-            point_type = "Maximum"
-        else:
-            point_type = "Saddle Point"
-        
-        # Display results
-        print(f"\nStationary Point (coded units):")
-        print(f"  X₁ = {X_stat_coded[0]:+.4f}")
-        print(f"  X₂ = {X_stat_coded[1]:+.4f}")
-        
-        print(f"\nStationary Point (natural units):")
-        print(f"  {self.factor_names[0]} = {X_stat_natural[0]:.4f}")
-        print(f"  {self.factor_names[1]} = {X_stat_natural[1]:.4f}")
-        
-        print(f"\nPredicted Response:")
-        print(f"  {response} = {Y_stat:.4f}")
-        
-        print(f"\nPoint Classification: {point_type}")
-        print(f"  Eigenvalues: {eigenvalues}")
-        
-        result = {
-            'X_coded': X_stat_coded,
-            'X_natural': X_stat_natural,
-            'Y_predicted': Y_stat,
-            'point_type': point_type,
-            'eigenvalues': eigenvalues
+        return {
+            'Y1_net_benefit': Y1,
+            'Y2_fulfillment_rate': Y2,
+            'Y3_outsourcing_cost': Y3,
+            'Y4_waste_rate': Y4,
+            'Y5_saturation_days': Y5,
+            'total_donated': metrics['total_donated'],
+            'total_wasted': metrics['total_wasted'],
+            'total_available': metrics['total_available']
         }
-        
-        return result
     
-    def plot_contour(self, response='Y1', filename=None, num_points=50):
+    def run_experiment(self, output_file='experiment2_results.csv'):
         """
-        Plot contour plot of response surface.
-        
-        Args:
-            response: 'Y1' or 'Y2'
-            filename: Output filename
-            num_points: Resolution of grid
+        Execute all experimental runs.
         """
-        if filename is None:
-            filename = f'contour_{response}.png'
+        print("\n" + "="*80)
+        print("EXECUTING EXPERIMENT 2: FLEET CAPACITY & ROUTING STRATEGY")
+        print("="*80)
         
-        # Create grid
-        low1, high1 = self.factors[self.factor_names[0]]
-        low2, high2 = self.factors[self.factor_names[1]]
+        total_runs = len(self.experimental_runs)
+        temp_files = []  # for cleanup later
         
-        x1_grid = np.linspace(low1, high1, num_points)
-        x2_grid = np.linspace(low2, high2, num_points)
-        X1_mesh, X2_mesh = np.meshgrid(x1_grid, x2_grid)
+        for idx, run_config in enumerate(self.experimental_runs, 1):
+            print(f"\n{'='*80}")
+            print(f"RUN {idx}/{total_runs}")
+            print(f"  Fleet Capacity: {run_config['fleet_capacity']:,} kg")
+            print(f"  Indirect %: {run_config['indirect_percentage']}%")
+            print(f"  Replica: {run_config['replica']}")
+            print(f"{'='*80}")
+            
+            start_time = time.time()
+            temp_file = f"temp_instance_run_{run_config['run_id']}.json"
+            temp_files.append(temp_file)
+            
+            try:
+                # Create instance
+                instance_data = self._create_instance_for_run(run_config)
+                
+                # Save temporary file
+                with open(temp_file, 'w', encoding='utf-8') as f:
+                    json.dump(instance_data, f, indent=2)
+                
+                # Solve with Gurobi
+                with gp.Env(empty=True) as env:
+                    env.setParam('OutputFlag', 0)
+                    env.setParam('TimeLimit', 300)
+                    env.setParam('MIPFocus', 1)
+                    env.setParam('Threads', 4)
+                    env.start()
+                    
+                    with FoodDonationOptimizer(env) as optimizer:
+                        optimizer.load_data_from_json(temp_file)
+                        optimizer.build_model()
+                        status = optimizer.optimize()
+                        
+                        if status in [GRB.OPTIMAL, GRB.TIME_LIMIT] and optimizer.model.SolCount > 0:
+                            responses = self._calculate_response_variables(optimizer, run_config)
+                            if responses:
+                                result = {
+                                    **run_config,
+                                    **responses,
+                                    'solve_time': time.time() - start_time,
+                                    'status': 'OPTIMAL' if status == GRB.OPTIMAL else 'TIME_LIMIT',
+                                    'gap': optimizer.model.MIPGap if status == GRB.TIME_LIMIT else 0
+                                }
+                                self.results.append(result)
+                                
+                                print(f"\n✓ Run completed successfully")
+                                print(f"  Y1 (Net Benefit): ${responses['Y1_net_benefit']:,.2f}")
+                                print(f"  Y2 (Fulfillment): {responses['Y2_fulfillment_rate']:.2f}%")
+                                print(f"  Y3 (Outsourcing): ${responses['Y3_outsourcing_cost']:,.2f}")
+                                print(f"  Y4 (Waste Rate): {responses['Y4_waste_rate']:.2f}%")
+                                print(f"  Y5 (Saturation): {responses['Y5_saturation_days']} days")
+                                print(f"  Solve time: {result['solve_time']:.2f}s")
+                            else:
+                                print(f"\n⚠️ Could not calculate response variables")
+                        else:
+                            print(f"\n⚠️ No solution found (Status: {status})")
+                
+            except Exception as e:
+                print(f"\n❌ Error in run {idx}: {e}")
+                import traceback
+                traceback.print_exc()
+                # Optional: save the problematic JSON for debugging
+                # with open(f"error_run_{run_config['run_id']}.json", 'w') as f:
+                #     json.dump(instance_data, f, indent=2)
         
-        # Convert to coded units
-        X_natural_grid = np.column_stack([X1_mesh.ravel(), X2_mesh.ravel()])
-        X_coded_grid = self._encode_to_coded(X_natural_grid)
+        # Clean up temporary files
+        for f in temp_files:
+            if os.path.exists(f):
+                os.remove(f)
         
-        # Create design matrix
-        X_design_grid = np.column_stack([
-            np.ones(len(X_coded_grid)),
-            X_coded_grid[:, 0],
-            X_coded_grid[:, 1],
-            X_coded_grid[:, 0]**2,
-            X_coded_grid[:, 1]**2,
-            X_coded_grid[:, 0] * X_coded_grid[:, 1]
-        ])
-        
-        # Predict response
-        if response == 'Y1':
-            Y_pred = self.model_Y1.predict(X_design_grid)
-            title = 'Response Surface: Y₁ (Fulfillment Rate %)'
-            cbar_label = 'Fulfillment Rate (%)'
+        # Save results
+        if self.results:
+            df = pd.DataFrame(self.results)
+            df.to_csv(output_file, index=False)
+            print(f"\n✓ Results saved to '{output_file}'")
+            print(f"  Total successful runs: {len(self.results)}/{total_runs}")
         else:
-            Y_pred = self.model_Y2.predict(X_design_grid)
-            title = 'Response Surface: Y₂ (Outsourcing Cost $)'
-            cbar_label = 'Outsourcing Cost ($)'
+            print(f"\n⚠️ No results to save")
+    
+    def analyze_results(self, results_file='experiment2_results.csv'):
+        """
+        Perform statistical analysis and generate visualizations.
+        """
+        # Load results
+        df = pd.read_csv(results_file)
         
-        Y_mesh = Y_pred.reshape(X1_mesh.shape)
+        print("\n" + "="*80)
+        print("EXPERIMENTAL ANALYSIS")
+        print("="*80)
         
-        # Plot
-        fig, ax = plt.subplots(figsize=(12, 9))
+        self._analyze_main_effects(df)
+        self._analyze_interactions(df)
+        self._compare_scenarios(df)
+    
+    def _analyze_main_effects(self, df):
+        """Analyze and plot main effects."""
+        print("\n" + "-"*80)
+        print("1. MAIN EFFECTS ANALYSIS")
+        print("-"*80)
         
-        contour = ax.contourf(X1_mesh, X2_mesh, Y_mesh, levels=20, cmap='viridis')
-        contour_lines = ax.contour(X1_mesh, X2_mesh, Y_mesh, levels=10, colors='white', 
-                                   linewidths=0.5, alpha=0.5)
-        ax.clabel(contour_lines, inline=True, fontsize=8, fmt='%.1f')
+        response_vars = ['Y1_net_benefit', 'Y2_fulfillment_rate', 'Y3_outsourcing_cost', 
+                        'Y4_waste_rate', 'Y5_saturation_days']
         
-        # Add colorbar
-        cbar = plt.colorbar(contour, ax=ax)
-        cbar.set_label(cbar_label, fontsize=11, fontweight='bold')
+        for response in response_vars:
+            print(f"\n{response}:")
+            fleet_means = df.groupby('fleet_capacity')[response].mean()
+            print(f"  Fleet Capacity Effect:")
+            for level, value in fleet_means.items():
+                print(f"    {level:,} kg: {value:.2f}")
+            
+            indirect_means = df.groupby('indirect_percentage')[response].mean()
+            print(f"  Indirect % Effect:")
+            for level, value in indirect_means.items():
+                print(f"    {level}%: {value:.2f}")
         
-        # Plot experimental points
-        df_optimal = self.results_df[self.results_df['status'] == 'Optimal']
-        ax.scatter(df_optimal[self.factor_names[0]], 
-                  df_optimal[self.factor_names[1]],
-                  c='red', s=50, marker='o', edgecolors='white', linewidth=1.5,
-                  label='Experimental Points', zorder=5)
+        # Plots
+        fig, axes = plt.subplots(2, 5, figsize=(20, 8))
+        fig.suptitle('Main Effects Plot', fontsize=16, fontweight='bold')
         
-        # Labels
-        ax.set_xlabel(self.factor_names[0], fontsize=12, fontweight='bold')
-        ax.set_ylabel(self.factor_names[1], fontsize=12, fontweight='bold')
-        ax.set_title(title, fontsize=14, fontweight='bold')
-        ax.legend(fontsize=10)
-        ax.grid(True, alpha=0.3)
+        for idx, response in enumerate(response_vars):
+            ax1 = axes[0, idx]
+            fleet_means = df.groupby('fleet_capacity')[response].mean()
+            ax1.plot(fleet_means.index, fleet_means.values, marker='o', linewidth=2, markersize=8)
+            ax1.set_xlabel('Fleet Capacity (kg)')
+            ax1.set_ylabel(response.replace('_', ' ').title())
+            ax1.grid(True, alpha=0.3)
+            ax1.set_title(f'Fleet Effect on {response.split("_")[0]}')
+            
+            ax2 = axes[1, idx]
+            indirect_means = df.groupby('indirect_percentage')[response].mean()
+            ax2.plot(indirect_means.index, indirect_means.values, marker='s', linewidth=2, markersize=8, color='orange')
+            ax2.set_xlabel('Indirect Routes (%)')
+            ax2.set_ylabel(response.replace('_', ' ').title())
+            ax2.grid(True, alpha=0.3)
+            ax2.set_title(f'Routing Effect on {response.split("_")[0]}')
         
         plt.tight_layout()
-        plt.savefig(filename, dpi=300, bbox_inches='tight')
-        print(f"\n✓ Contour plot saved to: {filename}")
-        plt.close()
+        plt.savefig('experiment2_main_effects.png', dpi=300, bbox_inches='tight')
+        print(f"\n✓ Main effects plot saved to 'experiment2_main_effects.png'")
+        plt.show()
     
-    def plot_surface_3d(self, response='Y1', filename=None, num_points=50):
-        """
-        Plot 3D surface of response.
+    def _analyze_interactions(self, df):
+        """Analyze and plot interaction effects."""
+        print("\n" + "-"*80)
+        print("2. INTERACTION ANALYSIS")
+        print("-"*80)
         
-        Args:
-            response: 'Y1' or 'Y2'
-            filename: Output filename
-            num_points: Resolution of grid
-        """
-        if filename is None:
-            filename = f'surface_3d_{response}.png'
+        response_vars = ['Y1_net_benefit', 'Y4_waste_rate', 'Y3_outsourcing_cost']
         
-        # Create grid
-        low1, high1 = self.factors[self.factor_names[0]]
-        low2, high2 = self.factors[self.factor_names[1]]
+        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+        fig.suptitle('Interaction Effects: Fleet Capacity × Indirect %', fontsize=16, fontweight='bold')
         
-        x1_grid = np.linspace(low1, high1, num_points)
-        x2_grid = np.linspace(low2, high2, num_points)
-        X1_mesh, X2_mesh = np.meshgrid(x1_grid, x2_grid)
-        
-        # Convert to coded units and predict
-        X_natural_grid = np.column_stack([X1_mesh.ravel(), X2_mesh.ravel()])
-        X_coded_grid = self._encode_to_coded(X_natural_grid)
-        
-        X_design_grid = np.column_stack([
-            np.ones(len(X_coded_grid)),
-            X_coded_grid[:, 0],
-            X_coded_grid[:, 1],
-            X_coded_grid[:, 0]**2,
-            X_coded_grid[:, 1]**2,
-            X_coded_grid[:, 0] * X_coded_grid[:, 1]
-        ])
-        
-        if response == 'Y1':
-            Y_pred = self.model_Y1.predict(X_design_grid)
-            title = '3D Response Surface: Y₁ (Fulfillment Rate)'
-            zlabel = 'Fulfillment Rate (%)'
-        else:
-            Y_pred = self.model_Y2.predict(X_design_grid)
-            title = '3D Response Surface: Y₂ (Outsourcing Cost)'
-            zlabel = 'Outsourcing Cost ($)'
-        
-        Y_mesh = Y_pred.reshape(X1_mesh.shape)
-        
-        # Plot
-        fig = plt.figure(figsize=(14, 10))
-        ax = fig.add_subplot(111, projection='3d')
-        
-        surf = ax.plot_surface(X1_mesh, X2_mesh, Y_mesh, cmap='viridis',
-                              alpha=0.8, edgecolor='none', antialiased=True)
-        
-        # Add colorbar
-        cbar = fig.colorbar(surf, ax=ax, shrink=0.5, aspect=5)
-        cbar.set_label(zlabel, fontsize=10, fontweight='bold')
-        
-        # Plot experimental points
-        df_optimal = self.results_df[self.results_df['status'] == 'Optimal']
-        if response == 'Y1':
-            Y_exp = df_optimal['Y1_fulfillment_rate'].values
-        else:
-            Y_exp = df_optimal['Y2_outsourcing_cost'].values
-        
-        ax.scatter(df_optimal[self.factor_names[0]],
-                  df_optimal[self.factor_names[1]],
-                  Y_exp,
-                  c='red', s=50, marker='o', edgecolors='black', linewidth=1.5,
-                  label='Experimental Points', zorder=10)
-        
-        # Labels
-        ax.set_xlabel(self.factor_names[0], fontsize=11, fontweight='bold', labelpad=10)
-        ax.set_ylabel(self.factor_names[1], fontsize=11, fontweight='bold', labelpad=10)
-        ax.set_zlabel(zlabel, fontsize=11, fontweight='bold', labelpad=10)
-        ax.set_title(title, fontsize=13, fontweight='bold', pad=20)
-        ax.legend(fontsize=9)
-        
-        # Set viewing angle
-        ax.view_init(elev=25, azim=45)
+        for idx, response in enumerate(response_vars):
+            ax = axes[idx]
+            interaction_data = df.groupby(['fleet_capacity', 'indirect_percentage'])[response].mean().unstack()
+            for col in interaction_data.columns:
+                ax.plot(interaction_data.index, interaction_data[col], 
+                       marker='o', linewidth=2, markersize=8, label=f'{col}% Indirect')
+            ax.set_xlabel('Fleet Capacity (kg)', fontsize=11)
+            ax.set_ylabel(response.replace('_', ' ').title(), fontsize=11)
+            ax.set_title(f'Interaction on {response.split("_")[0]}', fontsize=12, fontweight='bold')
+            ax.legend(title='Indirect Routes', loc='best')
+            ax.grid(True, alpha=0.3)
         
         plt.tight_layout()
-        plt.savefig(filename, dpi=300, bbox_inches='tight')
-        print(f"✓ 3D surface plot saved to: {filename}")
-        plt.close()
+        plt.savefig('experiment2_interactions.png', dpi=300, bbox_inches='tight')
+        print(f"\n✓ Interaction plot saved to 'experiment2_interactions.png'")
+        plt.show()
+        
+        print("\nInteraction Assessment:")
+        print("  (Non-parallel lines indicate interaction effects)")
+    
+    def _compare_scenarios(self, df):
+        """Compare scenarios and identify optimal configuration."""
+        print("\n" + "-"*80)
+        print("3. SCENARIO COMPARISON")
+        print("-"*80)
+        
+        config_summary = df.groupby(['fleet_capacity', 'indirect_percentage']).agg({
+            'Y1_net_benefit': ['mean', 'std'],
+            'Y2_fulfillment_rate': ['mean', 'std'],
+            'Y3_outsourcing_cost': ['mean', 'std'],
+            'Y4_waste_rate': ['mean', 'std'],
+            'Y5_saturation_days': ['mean', 'std']
+        }).round(2)
+        
+        config_summary.columns = ['_'.join(col).strip() for col in config_summary.columns.values]
+        config_summary = config_summary.reset_index()
+        config_summary['rank'] = config_summary['Y1_net_benefit_mean'].rank(ascending=False)
+        config_summary = config_summary.sort_values('rank')
+        
+        print("\nConfiguration Ranking (by Net Benefit):")
+        print(config_summary[['fleet_capacity', 'indirect_percentage', 'Y1_net_benefit_mean', 
+                              'Y2_fulfillment_rate_mean', 'Y4_waste_rate_mean', 'rank']].to_string(index=False))
+        
+        best_config = config_summary.iloc[0]
+        print(f"\n{'='*80}")
+        print("OPTIMAL CONFIGURATION:")
+        print(f"  Fleet Capacity: {best_config['fleet_capacity']:,.0f} kg")
+        print(f"  Indirect Routes: {best_config['indirect_percentage']:.0f}%")
+        print(f"  Net Benefit: ${best_config['Y1_net_benefit_mean']:,.2f} ± ${best_config['Y1_net_benefit_std']:,.2f}")
+        print(f"  Fulfillment Rate: {best_config['Y2_fulfillment_rate_mean']:.2f}% ± {best_config['Y2_fulfillment_rate_std']:.2f}%")
+        print(f"  Waste Rate: {best_config['Y4_waste_rate_mean']:.2f}% ± {best_config['Y4_waste_rate_std']:.2f}%")
+        print(f"{'='*80}")
+        
+        # 3D and contour plots
+        fig = plt.figure(figsize=(12, 5))
+        ax1 = fig.add_subplot(121, projection='3d')
+        X = config_summary['fleet_capacity'].values
+        Y = config_summary['indirect_percentage'].values
+        Z = config_summary['Y1_net_benefit_mean'].values
+        ax1.scatter(X, Y, Z, c=Z, cmap='viridis', s=200, edgecolors='black', linewidth=1.5)
+        ax1.set_xlabel('Fleet Capacity (kg)', fontsize=10)
+        ax1.set_ylabel('Indirect Routes (%)', fontsize=10)
+        ax1.set_zlabel('Net Benefit (USD)', fontsize=10)
+        ax1.set_title('3D Response Surface: Net Benefit', fontsize=12, fontweight='bold')
+        
+        ax2 = fig.add_subplot(122)
+        fleet_levels = sorted(config_summary['fleet_capacity'].unique())
+        indirect_levels = sorted(config_summary['indirect_percentage'].unique())
+        Z_matrix = config_summary.pivot(index='indirect_percentage', 
+                                        columns='fleet_capacity', 
+                                        values='Y1_net_benefit_mean').values
+        X_grid, Y_grid = np.meshgrid(fleet_levels, indirect_levels)
+        contour = ax2.contourf(X_grid, Y_grid, Z_matrix, levels=10, cmap='viridis')
+        ax2.scatter(config_summary['fleet_capacity'], 
+                   config_summary['indirect_percentage'], 
+                   c='red', s=100, edgecolors='white', linewidth=2, zorder=5)
+        ax2.scatter(best_config['fleet_capacity'], 
+                   best_config['indirect_percentage'],
+                   c='lime', s=300, marker='*', edgecolors='black', linewidth=2, zorder=6,
+                   label='Optimal')
+        ax2.set_xlabel('Fleet Capacity (kg)', fontsize=11)
+        ax2.set_ylabel('Indirect Routes (%)', fontsize=11)
+        ax2.set_title('Contour Plot: Net Benefit', fontsize=12, fontweight='bold')
+        ax2.legend(loc='best')
+        plt.colorbar(contour, ax=ax2, label='Net Benefit (USD)')
+        plt.tight_layout()
+        plt.savefig('experiment2_response_surface.png', dpi=300, bbox_inches='tight')
+        print(f"\n✓ Response surface plot saved to 'experiment2_response_surface.png'")
+        plt.show()
+        
+        print("\nTrade-off Analysis (Top 3 Configurations):")
+        top3 = config_summary.head(3)
+        for idx, row in top3.iterrows():
+            print(f"\n  Rank #{int(row['rank'])}:")
+            print(f"    Configuration: Fleet={row['fleet_capacity']:,.0f} kg, Indirect={row['indirect_percentage']:.0f}%")
+            print(f"    Net Benefit: ${row['Y1_net_benefit_mean']:,.2f}")
+            print(f"    Fulfillment: {row['Y2_fulfillment_rate_mean']:.2f}%")
+            print(f"    Outsourcing Cost: ${row['Y3_outsourcing_cost_mean']:,.2f}")
+            print(f"    Waste Rate: {row['Y4_waste_rate_mean']:.2f}%")
+            print(f"    Saturation Days: {row['Y5_saturation_days_mean']:.1f}")
 
 
-# ==============================================================================
-# MAIN EXECUTION
-# ==============================================================================
+# %% [markdown]
+# ## 3️⃣ Execute Experiment
 
+# %%
 def main():
-    """Main execution function."""
+    """Main execution function for Experiment 2."""
     
     print("="*80)
-    print("EXPERIMENT 2: RESPONSE SURFACE METHODOLOGY")
-    print("Central Composite Design (CCD)")
+    print("EXPERIMENT 2: FLEET CAPACITY & ROUTING STRATEGY OPTIMIZATION")
     print("="*80)
     
-    # -------------------------------------------------------------------------
-    # STEP 1: Define experimental factors
-    # -------------------------------------------------------------------------
+    # Initialize experiment
+    experiment = ExperimentDesign('instance_distance_exp.json')
     
-    factors = {
-        'X1_bank_capacity_multiplier': (0.6, 1.5),  # 60% to 150% of base capacities
-        'X2_fleet_capacity': (4000, 12000)  # Fleet capacity range in kg
-    }
+    # Display experimental matrix
+    print("\nExperimental Matrix:")
+    df_matrix = pd.DataFrame(experiment.experimental_runs)
+    print(df_matrix.head(10))
     
-    num_replicates = 3  # Number of replicates per design point
+    # Run all experiments
+    experiment.run_experiment(output_file='experiment2_results.csv')
     
-    print("\n📋 EXPERIMENTAL SETUP:")
-    print(f"\n  Factor X₁: {factors['X1_bank_capacity_multiplier']}")
-    print(f"    Description: Multiplier for ALL bank capacities")
-    print(f"    Range: {factors['X1_bank_capacity_multiplier'][0]} to {factors['X1_bank_capacity_multiplier'][1]}")
-    print(f"    (1.0 = 100% of base capacities)")
-    
-    print(f"\n  Factor X₂: {factors['X2_fleet_capacity']}")
-    print(f"    Description: Company-owned fleet capacity")
-    print(f"    Range: {factors['X2_fleet_capacity'][0]} to {factors['X2_fleet_capacity'][1]} kg")
-    print(f"    (Base: 8000 kg)")
-    
-    print(f"\n  Response Y₁: Fulfillment Rate (%)")
-    print(f"    Total delivered / Total available")
-    
-    print(f"\n  Response Y₂: Total Outsourcing Cost ($)")
-    
-    print(f"\n  Replicates per design point: {num_replicates}")
-    
-    # -------------------------------------------------------------------------
-    # STEP 2: Generate Central Composite Design
-    # -------------------------------------------------------------------------
-    
-    experiment = ExperimentCCD(factors, num_replicates=num_replicates)
-    design_matrix = experiment.generate_design()
-    
-    # Save and visualize design
-    df_design = experiment.save_design('experimental_design_ccd.csv')
-    experiment.visualize_design('ccd_design_plot.png')
-    
-    print("\n" + df_design.to_string())
-    
-    # -------------------------------------------------------------------------
-    # STEP 3: Run simulations
-    # -------------------------------------------------------------------------
-    
-    data_file = 'instance_distance_exp.json'
-    
-    if not os.path.exists(data_file):
-        print(f"\n❌ ERROR: Data file '{data_file}' not found!")
-        print("   Please ensure the instance file is in the current directory.")
-        return
-    
-    simulator = OptimizationSimulator(data_file, num_replicates=num_replicates)
-    
-    print("\n⏳ Starting experimental runs...")
-    print("   This may take several hours depending on instance size.")
-    print("   Progress will be displayed for each run.")
-    
-    start_time = time.time()
-    df_results = simulator.run_experiment(design_matrix, experiment.factor_names)
-    total_time = time.time() - start_time
-    
-    print(f"\n⏱️ Total experimental time: {total_time/60:.2f} minutes")
-    print(f"   Average time per run: {total_time/len(df_results):.2f} seconds")
-    
-    # Save results
-    df_results.to_csv('experimental_results_ccd.csv', index=False)
-    print(f"\n✓ Results saved to: experimental_results_ccd.csv")
-    
-    # -------------------------------------------------------------------------
-    # STEP 4: Analyze results and fit response surfaces
-    # -------------------------------------------------------------------------
-    
-    analysis = ResponseSurfaceAnalysis(df_results, factors)
-    
-    # Fit models
-    analysis.fit_models()
-    
-    # Find stationary points
-    stat_Y1 = analysis.find_stationary_point(response='Y1')
-    stat_Y2 = analysis.find_stationary_point(response='Y2')
-    
-    # -------------------------------------------------------------------------
-    # STEP 5: Generate visualizations
-    # -------------------------------------------------------------------------
-    
-    print("\n" + "="*80)
-    print("GENERATING VISUALIZATIONS")
-    print("="*80)
-    
-    # Contour plots
-    analysis.plot_contour(response='Y1', filename='contour_Y1_fulfillment.png')
-    analysis.plot_contour(response='Y2', filename='contour_Y2_outsourcing.png')
-    
-    # 3D surface plots
-    analysis.plot_surface_3d(response='Y1', filename='surface_3d_Y1_fulfillment.png')
-    analysis.plot_surface_3d(response='Y2', filename='surface_3d_Y2_outsourcing.png')
-    
-    # -------------------------------------------------------------------------
-    # STEP 6: Final summary
-    # -------------------------------------------------------------------------
-    
-    print("\n" + "="*80)
-    print("EXPERIMENT COMPLETED SUCCESSFULLY")
-    print("="*80)
-    
-    print("\n📁 Generated Files:")
-    print("  1. experimental_design_ccd.csv - Design matrix")
-    print("  2. experimental_results_ccd.csv - All simulation results")
-    print("  3. ccd_design_plot.png - Design visualization")
-    print("  4. contour_Y1_fulfillment.png - Y₁ contour plot")
-    print("  5. contour_Y2_outsourcing.png - Y₂ contour plot")
-    print("  6. surface_3d_Y1_fulfillment.png - Y₁ 3D surface")
-    print("  7. surface_3d_Y2_outsourcing.png - Y₂ 3D surface")
-    
-    if stat_Y1:
-        print("\n🎯 OPTIMAL CONFIGURATION (for maximizing Y₁):")
-        print(f"  Bank Capacity Multiplier: {stat_Y1['X_natural'][0]:.4f}")
-        print(f"  Fleet Capacity: {stat_Y1['X_natural'][1]:.2f} kg")
-        print(f"  Predicted Fulfillment Rate: {stat_Y1['Y_predicted']:.2f}%")
-        print(f"  Point Type: {stat_Y1['point_type']}")
-    
-    print("\n✓ Analysis complete! Review the generated files for detailed results.")
+    # Analyze results
+    if experiment.results:
+        experiment.analyze_results(results_file='experiment2_results.csv')
+    else:
+        print("\n⚠️ No results to analyze")
 
 
 if __name__ == "__main__":
     main()
 
+# %% [markdown]
+# ## 4️⃣ Optional: Load and Re-analyze Existing Results
 
+# %%
+# If you already have results and just want to re-run the analysis:
+#
+# experiment = ExperimentDesign('instance_distance_exp.json')
+# experiment.analyze_results('experiment2_results.csv')
 
+print("\n✓ Experiment 2 code ready to execute")
